@@ -1,0 +1,20 @@
+TDPlay AI Video Render makes one continuous AI video shot, segment by segment, with picture and sound,
+on your own PC. It is free and runs offline once it is set up.
+
+What you need
+- Windows 11 with a current AMD Adrenalin driver
+- AMD Radeon RX 7900 / 7800 / 7700 / 7600 or RX 9070 / 9060 (or Radeon AI PRO R9700), or an NVIDIA RTX card
+- 16 GB of RAM or more (32 GB recommended)
+- About 70 GB of free disk space (an SSD helps)
+
+What happens during the installation
+After copying the app, a setup window finds your graphics card and downloads what the app needs:
+Python, PyTorch for your card (AMD ROCm or NVIDIA CUDA), Lightricks' LTX-2 code and ffmpeg.
+That is several GB and takes a while. At the end it offers to download the video model (about 55 GB);
+you can also do that later in the app's Models tab.
+
+Licenses
+The LTX-2 model and code by Lightricks are under the LTX-2 Community License: free to use, but
+organizations with annual revenue of $10M or more need a paid commercial license from Lightricks, and
+it has an acceptable-use policy. Read it before any commercial use:
+https://huggingface.co/Lightricks/LTX-2.3/blob/main/LICENSE

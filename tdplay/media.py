@@ -28,17 +28,24 @@ TAIL_CRF = 8
 NO_WINDOW: dict = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 
-def _bin(name: str) -> str:
+#: Where the Windows setup puts its own ffmpeg (the version the app is tested with), next to the app.
+VENDOR_FFMPEG = Path(__file__).resolve().parent.parent / "vendor" / "ffmpeg" / "bin"
+
+
+def tool(name: str) -> str:
+    """Path of ``ffmpeg`` or ``ffprobe``: the app's own copy if it has one, else the one on PATH."""
+    exe = f"{name}.exe" if os.name == "nt" else name
+    if (VENDOR_FFMPEG / exe).exists():
+        return str(VENDOR_FFMPEG / exe)
     path = shutil.which(name)
     if path is None and os.name == "nt":
         # winget puts ffmpeg here; until the next sign-in, the app may not have it on its PATH yet.
         links = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links"
-        if (links / f"{name}.exe").exists():
-            os.environ["PATH"] = f"{links}{os.pathsep}{os.environ.get('PATH', '')}"  # child processes too
-            path = str(links / f"{name}.exe")
+        if (links / exe).exists():
+            path = str(links / exe)
     if path is None:
-        install = "winget install Gyan.FFmpeg" if os.name == "nt" else "brew install ffmpeg"
-        raise RuntimeError(f"{name} was not found. Install it with:  {install}")
+        fix = "run the setup again (install.bat)" if os.name == "nt" else "install it with:  brew install ffmpeg"
+        raise RuntimeError(f"{name} was not found: {fix}")
     return path
 
 
@@ -61,7 +68,7 @@ class VideoInfo:
 
 def probe(path: str | Path) -> VideoInfo:
     """Read size, frame count, frame rate and whether there is an audio track."""
-    out = _run([_bin("ffprobe"), "-v", "error", "-print_format", "json", "-show_streams", "-show_format", str(path)])
+    out = _run([tool("ffprobe"), "-v", "error", "-print_format", "json", "-show_streams", "-show_format", str(path)])
     data = json.loads(out)
     streams = data.get("streams", [])
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
@@ -72,7 +79,7 @@ def probe(path: str | Path) -> VideoInfo:
     frames = int(video.get("nb_frames") or 0)
     if frames == 0:
         counted = _run(
-            [_bin("ffprobe"), "-v", "error", "-count_frames", "-select_streams", "v:0",
+            [tool("ffprobe"), "-v", "error", "-count_frames", "-select_streams", "v:0",
              "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(path)]
         )
         frames = int(counted.decode().strip() or 0)
@@ -88,7 +95,7 @@ def probe(path: str | Path) -> VideoInfo:
 def read_frames(path: str | Path, width: int, height: int) -> np.ndarray:
     """Decode every frame of ``path`` as RGB, scaled to ``width x height`` if it is not already."""
     raw = _run(
-        [_bin("ffmpeg"), "-v", "error", "-i", str(path), "-map", "0:v:0", "-fps_mode", "passthrough",
+        [tool("ffmpeg"), "-v", "error", "-i", str(path), "-map", "0:v:0", "-fps_mode", "passthrough",
          "-s", f"{width}x{height}", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
     )
     return np.frombuffer(raw, dtype=np.uint8).reshape(-1, height, width, 3).copy()
@@ -99,7 +106,7 @@ def read_audio(path: str | Path) -> np.ndarray:
     if not probe(path).has_audio:
         return np.zeros((0, CHANNELS), dtype=np.float32)
     raw = _run(
-        [_bin("ffmpeg"), "-v", "error", "-i", str(path), "-map", "0:a:0", "-vn", "-ac", str(CHANNELS),
+        [tool("ffmpeg"), "-v", "error", "-i", str(path), "-map", "0:a:0", "-vn", "-ac", str(CHANNELS),
          "-ar", str(SAMPLE_RATE), "-f", "f32le", "-acodec", "pcm_f32le", "-"]
     )
     return np.frombuffer(raw, dtype=np.float32).reshape(-1, CHANNELS).copy()
@@ -138,7 +145,7 @@ def write_video(path: str | Path, frames: Iterable[np.ndarray] | np.ndarray, fps
     """Encode RGB frames to an H.264 mp4, optionally muxing ``audio`` as AAC."""
     frames = np.asarray(frames)
     height, width = frames.shape[1:3]
-    cmd = [_bin("ffmpeg"), "-v", "error", "-y",
+    cmd = [tool("ffmpeg"), "-v", "error", "-y",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps), "-i", "-"]
     # Every chunk shares these settings so the concat demuxer can join them without re-encoding.
     codec = ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p", "-r", str(fps)]
@@ -160,7 +167,7 @@ def normalize_clip(src: str | Path, dst: str | Path, width: int, height: int, fp
     """Scale + center-crop a user video to the project size and frame rate, with a stereo 48 kHz track."""
     vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},fps={fps},setsar=1"
     has_audio = probe(src).has_audio
-    cmd = [_bin("ffmpeg"), "-v", "error", "-y", "-i", str(src)]
+    cmd = [tool("ffmpeg"), "-v", "error", "-y", "-i", str(src)]
     if not has_audio:
         cmd += ["-f", "lavfi", "-i", f"anullsrc=r={SAMPLE_RATE}:cl=stereo"]
     cmd += ["-map", "0:v:0", "-map", "0:a:0" if has_audio else "1:a:0", "-vf", vf,
@@ -188,7 +195,7 @@ def assemble(video_chunks: list[Path], audio_chunks: list[Path], out_path: str |
     tmp_out = work / f".{out_path.stem}_tmp.mp4"
     try:
         _run(
-            [_bin("ffmpeg"), "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-i", str(wav_file),
+            [tool("ffmpeg"), "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-i", str(wav_file),
              "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
              str(tmp_out)]
         )

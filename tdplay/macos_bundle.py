@@ -1,11 +1,14 @@
 """Build "TDPlay AI Video Render.app" so the app opens from Applications, Launchpad, Spotlight or the Dock.
 
-install.command runs ``python -m tdplay.macos_bundle``. The bundle is a small launcher: its executable
-is a shell script that runs ``python -m tdplay.desktop_app`` from this install folder (output goes to
-``~/TDPlay/logs/app.log``). Run install.command again if you move the folder.
+Two kinds of bundle:
 
-The bundle is built on your Mac, so it carries no "downloaded from the internet" flag and opens
-without a Gatekeeper prompt.
+* ``python -m tdplay.macos_bundle`` (what install.command runs) builds a small launcher: its
+  executable is a shell script that runs ``python -m tdplay.desktop_app`` from this install folder
+  (output goes to ``~/TDPlay/logs/app.log``). Run install.command again if you move the folder. It
+  is built on your Mac, so it carries no "downloaded from the internet" flag.
+* ``--standalone`` builds the app that goes into the disk image (``macos/build_dmg.sh``). It
+  carries the app's code itself; its first launch runs ``macos/setup.sh``, which installs Python,
+  MLX, LTX-2 and ffmpeg into ``~/TDPlay/runtime``, and it runs again after an update.
 """
 
 from __future__ import annotations
@@ -48,6 +51,74 @@ exec "${{APP_HOME}}/.venv/bin/python" -m tdplay.desktop_app >> "${{LOG_DIR}}/app
 """
 
 
+# The disk-image app: sets itself up on the first launch, then starts the app from ~/TDPlay/runtime.
+STANDALONE_LAUNCHER = r"""#!/bin/bash
+# Starts TDPlay AI Video Render. The first launch (and the first after an update) installs what the
+# app needs into ~/TDPlay/runtime (see Resources/app/macos/setup.sh); the log is ~/TDPlay/logs/setup.log.
+RES="$(cd "$(dirname "${0}")/../Resources" && pwd)"
+TD_HOME="${TDPLAY_HOME:-${HOME}/TDPlay}"
+RUNTIME="${TD_HOME}/runtime"
+LOG_DIR="${TD_HOME}/logs"
+SETUP_LOG="${LOG_DIR}/setup.log"
+export PATH="${RUNTIME}/bin:/opt/homebrew/bin:/usr/local/bin:${PATH}"
+mkdir -p "${LOG_DIR}"
+rotate() {
+  if [[ -f "${1}" ]] && (( $(wc -c < "${1}") > 5000000 )); then mv -f "${1}" "${1}.1"; fi
+}
+# Dialogs, except in TDPLAY_SETUP_ONLY mode (set up without starting the app; used by the tests).
+osa() {
+  if [[ -x /usr/bin/osascript && -z "${TDPLAY_SETUP_ONLY:-}" ]]; then /usr/bin/osascript "$@" >/dev/null 2>&1; fi
+}
+
+want="$(cat "${RES}/app/VERSION")"
+have="$(cat "${RUNTIME}/VERSION" 2>/dev/null || true)"
+if [[ "${want}" != "${have}" || ! -x "${RUNTIME}/venv/bin/python" ]]; then
+  LOCK="${TD_HOME}/.setup-lock"
+  if ! mkdir "${LOCK}" 2>/dev/null; then
+    pid="$(cat "${LOCK}/pid" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      osa -e 'display dialog "TDPlay AI Video Render is still setting up. It opens when it is ready." buttons {"OK"} default button "OK" with title "TDPlay AI Video Render" giving up after 60'
+      exit 0
+    fi
+  fi
+  echo "$$" > "${LOCK}/pid"
+  rotate "${SETUP_LOG}"
+  echo "--- $(date): setting up ${want} ---" >> "${SETUP_LOG}"
+  # A window while it works; it closes when the setup ends. "Show Details" opens the log.
+  dialog=""
+  if [[ -x /usr/bin/osascript && -z "${TDPLAY_SETUP_ONLY:-}" ]]; then
+    /usr/bin/osascript -e 'on run argv' -e 'activate' \
+      -e 'set r to display dialog "Setting up TDPlay AI Video Render. The first time, this downloads about 1 GB and takes a few minutes. The app opens when it is ready." buttons {"Show Details", "OK"} default button "OK" with title "TDPlay AI Video Render" giving up after 3600' \
+      -e 'if button returned of r is "Show Details" then do shell script "open -a Console " & quoted form of (item 1 of argv)' \
+      -e 'end run' "${SETUP_LOG}" >/dev/null 2>&1 &
+    dialog=$!
+  fi
+  status=0
+  /bin/bash "${RES}/app/macos/setup.sh" "${RES}/app" "${RUNTIME}" >> "${SETUP_LOG}" 2>&1 || status=$?
+  if [[ -n "${dialog}" ]]; then kill "${dialog}" 2>/dev/null; fi
+  rm -rf "${LOCK}"
+  if (( status != 0 )); then
+    reason="$(grep '^ERROR: ' "${SETUP_LOG}" | tail -1 | sed 's/^ERROR: //')"
+    osa -e 'on run argv' -e 'activate' \
+        -e 'set r to display alert "TDPlay AI Video Render could not finish setting up" message (item 2 of argv) buttons {"Show Log", "OK"} default button "OK"' \
+        -e 'if button returned of r is "Show Log" then do shell script "open -a Console " & quoted form of (item 1 of argv)' \
+        -e 'end run' "${SETUP_LOG}" "${reason:-Something went wrong.} Open the app again to retry."
+    exit 1
+  fi
+fi
+if [[ -n "${TDPLAY_SETUP_ONLY:-}" ]]; then
+  exit 0
+fi
+rotate "${LOG_DIR}/app.log"
+cd "${RUNTIME}/app" || exit 1
+echo "--- $(date) ---" >> "${LOG_DIR}/app.log"
+exec "${RUNTIME}/venv/bin/python" -m tdplay.desktop_app >> "${LOG_DIR}/app.log" 2>&1
+"""
+
+#: What the disk-image app carries in Contents/Resources/app.
+STANDALONE_FILES = ["tdplay", "requirements.txt", "macos/setup.sh"]
+
+
 def info_plist() -> dict:
     return {
         "CFBundleName": "TDPlay",
@@ -73,8 +144,12 @@ def default_destination() -> Path:
     return Path.home() / "Applications"
 
 
-def build(dest_dir: Path, root: Path = ROOT) -> Path:
-    """Write the bundle into ``dest_dir`` (replacing an earlier TDPlay bundle, never anything else)."""
+def build(dest_dir: Path, root: Path = ROOT, standalone: bool = False, build_id: str = "") -> Path:
+    """Write the bundle into ``dest_dir`` (replacing an earlier TDPlay bundle, never anything else).
+
+    ``standalone`` makes the disk-image app (see the module docs); ``build_id`` tells its builds apart,
+    so a new build of the same version still sets itself up again.
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     app = dest_dir / f"{APP_NAME}.app"
     if app.exists():
@@ -90,7 +165,19 @@ def build(dest_dir: Path, root: Path = ROOT) -> Path:
     (contents / "Info.plist").write_bytes(plistlib.dumps(info_plist()))
     (contents / "PkgInfo").write_text("APPL????")
     launcher = contents / "MacOS" / EXECUTABLE
-    launcher.write_text(LAUNCHER.format(home=shlex.quote(str(root.resolve()))))
+    if standalone:
+        launcher.write_text(STANDALONE_LAUNCHER)
+        app_dir = contents / "Resources" / "app"
+        for name in STANDALONE_FILES:
+            src, dst = root / name, app_dir / name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            else:
+                shutil.copy2(src, dst)
+        (app_dir / "VERSION").write_text(__version__ + (f"+{build_id}" if build_id else "") + "\n")
+    else:
+        launcher.write_text(LAUNCHER.format(home=shlex.quote(str(root.resolve()))))
     launcher.chmod(0o755)
     shutil.copy2(root / "tdplay" / "assets" / "AppIcon.icns", contents / "Resources" / "AppIcon.icns")
     if app.exists():
@@ -109,11 +196,13 @@ def register(app: Path) -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="python -m tdplay.macos_bundle", description="Install the Mac app bundle.")
     parser.add_argument("--dest", type=Path, help="folder to put the app in (default: /Applications or ~/Applications)")
+    parser.add_argument("--standalone", action="store_true", help="build the self-contained app for the disk image")
+    parser.add_argument("--build-id", default="", help="with --standalone: tells builds of one version apart")
     args = parser.parse_args(argv)
-    if args.dest is None and sys.platform != "darwin":
-        raise SystemExit("The app bundle is for macOS; pass --dest to build one elsewhere.")
-    app = build(args.dest or default_destination())
-    if sys.platform == "darwin":
+    if args.dest is None and (sys.platform != "darwin" or args.standalone):
+        raise SystemExit("Pass --dest: the folder to build the app in.")
+    app = build(args.dest or default_destination(), standalone=args.standalone, build_id=args.build_id)
+    if sys.platform == "darwin" and not args.standalone:
         register(app)
     print(f"Installed {app}")
 

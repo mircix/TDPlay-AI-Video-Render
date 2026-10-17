@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRIPTS = [ROOT / "install.bat", ROOT / "start.bat", ROOT / "windows" / "install.ps1"]
+SCRIPTS = [ROOT / "install.bat", ROOT / "start.bat", ROOT / "windows" / "install.ps1",
+           ROOT / "windows" / "installer" / "TDPlay.iss", ROOT / "windows" / "installer" / "before-install.txt"]
 
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
