@@ -2,14 +2,14 @@
 
 On a Mac the app in /Applications (see ``tdplay.macos_bundle``) runs this; on Windows the Start menu
 and desktop shortcuts made by install.bat do (``pythonw -m tdplay.desktop_app``). It starts the
-local server, shows it in a native window (pywebview: WebKit on macOS, WebView2 on Windows), keeps
-the computer from sleeping while it is open, and stops a running render when you quit. If a
-render, upscale or download is running, quitting asks first.
+local server, shows it in a native window (pywebview: WebKit on macOS, WebView2 on Windows) and
+keeps the computer from sleeping while it is open. Renders run in their own process
+(``tdplay.worker``), so they keep going after the window closes; opening the app again shows them.
+Only a model download stops when you quit, so quitting asks first while one is running.
 """
 
 from __future__ import annotations
 
-import atexit
 import os
 import shutil
 import socket
@@ -24,8 +24,8 @@ from pathlib import Path
 APP_NAME = "TDPlay AI Video Render"
 ASSETS = Path(__file__).resolve().parent / "assets"
 ICON = ASSETS / ("AppIcon.ico" if os.name == "nt" else "AppIcon.png")
-QUIT_WHILE_BUSY = ("A video is still being made. Quit anyway?\n\nFinished segments are kept: select the project in "
-                   "the Projects tab and press Resume next time.")
+QUIT_WHILE_BUSY = ("A model download is still running. Quit anyway?\n\nIt continues where it stopped when you "
+                   "press Download again.")
 
 
 def _free_port() -> int:
@@ -115,8 +115,6 @@ def main() -> None:
     app.launch(port=port, open_browser=False, block=False)
     _wait_for(url)
     print(f"{APP_NAME} is running at {url}", flush=True)
-    # Cmd+Q ends the process from inside AppKit, so the cleanup runs at exit rather than after start().
-    atexit.register(app.shutdown)
     _keep_awake()
 
     try:
@@ -141,7 +139,6 @@ def main() -> None:
     window.events.closing += on_closing
     _show_app_name_in_menu_bar()
     webview.start(icon=str(ICON), private_mode=False)
-    app.shutdown()
     os._exit(0)
 
 

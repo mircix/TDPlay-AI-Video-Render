@@ -236,6 +236,8 @@ class Event:
     text: str = ""
     fraction: float = 0.0
     path: str | None = None
+    #: When it happened (``time.time()``); set when the event is written to a job's ``events.jsonl``.
+    at: float = 0.0
 
 
 class _Stopped(Exception):
@@ -319,7 +321,7 @@ class Runner:
             p.save()
             yield Event("stopped", self._stopped_text())
         except GeneratorExit:
-            # The UI went away mid-run (e.g. the browser tab was closed): don't leave the model running.
+            # Whoever was reading the events stopped (closed the stream): don't leave the model running.
             self._stop.set()
             self._kill()
             p.status = "stopped"

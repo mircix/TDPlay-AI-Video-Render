@@ -37,7 +37,7 @@ one-time model download everything runs offline on your computer.
      **TDPlay AI Video Render** to your Applications folder. At the end it offers to download the recommended model
      for your Mac (30–45 GB). You can also do that later in the app's **Models** tab.
 3. Open **TDPlay AI Video Render** from Applications, Launchpad or Spotlight. It opens in its own window; drag its
-   icon to the Dock to keep it there. Quit it like any app (⌘Q). If a video is still being made, it asks first.
+   icon to the Dock to keep it there. Quit it like any app (⌘Q): a video that is being made keeps going.
    * `start.command` still works too: it opens the same app in your web browser, with a Terminal window showing the
      log.
    * If you move the `TDPlay-AI-Video-Render` folder, run `install.command` again so the app finds it.
@@ -49,6 +49,10 @@ one-time model download everything runs offline on your computer.
 2. Pick the number of **segments** and write **one prompt per segment**, each with a length in seconds.
 3. Press **Generate**. The shot so far appears after every segment, so you can watch it grow.
 4. The finished `render.mp4` is in the project folder (**Open project folder**).
+
+**Renders run in the background.** Close the window or quit the app whenever you like: the video keeps being made,
+and you get a notification when it's done. Open the app again to see the progress or the result. Only **Stop** stops
+it.
 
 ### 1080p and 4K
 
@@ -65,7 +69,7 @@ The shot is rendered at the size your Mac can handle (512p–704p) and enlarged 
 what is there; it cannot invent detail the way rendering natively at 4K would. 4K files use HEVC (H.265), which
 every current Mac, iPhone and browser plays.
 
-If a run stops for any reason (you pressed Stop, the Mac ran out of memory, you quit), press **Resume**.
+If a run stops for any reason (you pressed Stop, the Mac ran out of memory, it restarted), press **Resume**.
 Finished segments are kept. Older projects are in the **Projects** tab.
 
 ### Writing good segments
@@ -134,7 +138,7 @@ the lower resolutions. 8–12 GB cards are likely too small.
    * It adds **TDPlay AI Video Render** to the Start menu and the desktop, and offers to download the model
      (about 55 GB). You can also do that later in the app's **Models** tab.
 3. Open **TDPlay AI Video Render** from the Start menu or the desktop. It opens in its own window, in dark or light
-   mode like Windows. If a video is still being made when you close it, it asks first.
+   mode like Windows. Closing it doesn't stop a video that is being made.
    * `start.bat` opens the same app in your web browser, with a window showing the log.
 
 ### Recommended settings on Windows
@@ -183,6 +187,8 @@ weights stream from the SSD instead of being held in memory, which is what makes
   rest. The model's re-render of those 25 frames is used to blend the join, then dropped.
 * Each model run is a separate process. If macOS kills one for using too much memory, the app survives and you
   can press Resume.
+* The whole job runs in a background process of its own (`tdplay/worker.py`), not in the app: it writes its
+  progress to `events.jsonl` in the project folder, and any app window, also one opened later, follows that file.
 * Everything for a project lives in its own folder: the raw segments, the assembled chunks, a log and
   `project.json` (prompts, settings, seeds, progress).
 
@@ -210,6 +216,8 @@ H3 is a larger cloud model. Expect LTX-2 on a laptop to be good but not identica
   character turns away at a join.
 * **Nothing happens on double-click** → see the right-click → Open tip under Install.
 * **The full log** is `log.txt` in each project folder. The app's own log is `~/TDPlay/logs/app.log`.
+* **"Connection to the server was lost"** → the window lost its connection to the app (for example the Terminal
+  window of `start.command` was closed). The render itself keeps going: open the app again to follow it.
 * **The app doesn't open, or says its folder was moved** → run `install.command` again from the folder's current
   location.
 

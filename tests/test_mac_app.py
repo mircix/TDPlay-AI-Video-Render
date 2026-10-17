@@ -21,18 +21,13 @@ def test_window_opens_on_the_running_server(tmp_path):
     assert data["url"].startswith("http://127.0.0.1:") and data["status"] == 200
     assert data["icon_exists"] and data["downloads"] is True
     assert data["confirm_close"] is False  # nothing running: quit without asking
-    assert "still being made" in data["quit_message"]["global.quitConfirmation"]
+    assert "download is still running" in data["quit_message"]["global.quitConfirmation"]
 
 
-def test_quitting_asks_only_while_busy():
+def test_quitting_asks_only_while_downloading():
     from tdplay import app
 
-    assert not app.is_busy()
-    app._state["runner"] = object()
-    try:
-        assert app.is_busy()
-    finally:
-        app._state["runner"] = None
+    assert not app.is_busy()  # renders run in their own process and keep going after the app quits
     app._state["downloading"] = True
     try:
         assert app.is_busy()

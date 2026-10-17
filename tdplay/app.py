@@ -19,8 +19,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from tdplay import __version__, engine, models
-from tdplay.engine_torch import TorchRunner
+from tdplay import __version__, engine, models, worker
 
 MAX_SEGMENTS = 20
 PROJECTS_DIR = models.HOME / "projects"
@@ -55,7 +54,11 @@ IS_APPLE_SILICON = sys.platform == "darwin" and platform.machine() == "arm64"
 ENGINE_LABEL = "LTX-2 via MLX" if ON_MAC else "LTX-2 via PyTorch (AMD ROCm / NVIDIA CUDA)"
 COMPUTER = "Mac" if sys.platform == "darwin" else "PC"
 
-_state: dict = {"runner": None, "last_project": None}
+# job: (project folder, worker process) of the last job this app started.
+_state: dict = {"job": None, "last_project": None}
+BACKGROUND_NOTE = "It keeps going if you close this window."
+#: How long after a job ended a newly opened window still shows how it ended.
+RECENT_SECONDS = 24 * 3600
 
 THEMES = [("Match system", "system"), ("Light", "light"), ("Dark", "dark")]
 # Gradio's dark theme is the "dark" class on <body>. "system" follows the OS, also when it changes later.
@@ -178,53 +181,70 @@ def open_folder(path: str | None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _stream(project: engine.Project, job=lambda runner: runner.run(), resume_hint: bool = True):
-    """Run a job on ``project`` (by default: generate it) and turn its events into (status, video, log) updates."""
-    with _lock:
-        if _state["runner"] is not None:
-            yield (status_html("Already working — wait for it to finish or press Stop.", tone="warn"),
-                   gr.skip(), gr.skip())
-            return
-        runner = TorchRunner(project) if project.settings.backend == "torch" else engine.Runner(project)
-        _state["runner"], _state["last_project"] = runner, str(project.dir)
+def active_job() -> str | None:
+    """The project a background job is working on right now (renders run in their own process)."""
+    job = _state["job"]
+    if job is not None and job[1].poll() is None:  # started by this app and still running (or starting)
+        return job[0]
+    for lock in PROJECTS_DIR.glob(f"*/{worker.LOCK}"):  # started earlier, e.g. before the app was reopened
+        if worker.is_running(lock.parent):
+            return str(lock.parent)
+    return None
 
+
+def _start(project: engine.Project, job: list[str], resume_hint: bool = True):
+    """Start ``job`` on ``project`` in the background and follow it."""
+    with _lock:
+        busy = active_job()
+        if busy:
+            yield (status_html("Already working on another video — wait for it to finish or press Stop.",
+                               tone="warn", detail=Path(busy).name), gr.skip(), gr.skip())
+            return
+        proc = worker.start(project.dir, job)
+        _state["job"], _state["last_project"] = (str(project.dir), proc), str(project.dir)
+    yield from _watch(str(project.dir), proc, resume_hint)
+
+
+def _watch(project_dir: str, proc=None, resume_hint: bool = True):
+    """Follow a background job and turn its events into (status, video, log) updates."""
     log: deque[str] = deque(maxlen=400)
+    log.append(f"Project folder: {project_dir}")
     started = time.time()
-    last_push = 0.0
-    title, fraction, detail = "Starting…", 0.0, ""
-    log.append(f"Project folder: {project.dir}")
-    try:
-        for event in job(runner):
-            video = gr.skip()
-            if event.kind == "log":
-                log.append(event.text)
-            elif event.kind == "progress":
-                title, fraction = event.text, event.fraction
-                detail = _eta(started, fraction)
-            elif event.kind == "preview":
-                log.append(event.text)
-                fraction = event.fraction or fraction
-                video = event.path
-            elif event.kind == "done":
-                log.append(event.text)
-                yield (status_html("Done! " + event.text, 1.0, f"Saved to {event.path}", tone="ok"),
-                       event.path, log_html(log))
-                return
-            elif event.kind in ("error", "stopped"):
-                log.append(event.text)
-                tone = "warn" if event.kind == "stopped" else "error"
-                head = "Stopped." if event.kind == "stopped" else "Something went wrong."
-                detail = event.text.split("\n\n")[0] + ("  Press Resume to continue." if resume_hint else "")
-                yield status_html(head, fraction, detail, tone), gr.skip(), log_html(log)
-                return
-            # tqdm lines arrive many times a second; refresh the page at most twice a second.
-            now = time.time()
-            if event.kind != "log" or now - last_push > 0.5:
-                last_push = now
-                yield status_html(title, fraction, detail), video, log_html(log)
-    finally:
-        with _lock:
-            _state["runner"] = None
+    title, fraction, eta, video = "Starting…", 0.0, "", gr.skip()
+    changed, last_push = True, 0.0
+    for event in worker.follow(project_dir, proc):
+        if event is None:
+            pass
+        elif event.kind == "queued":
+            started = event.at or started
+        elif event.kind == "log":
+            log.append(event.text)
+        elif event.kind == "progress":
+            title, fraction = event.text, event.fraction
+            eta = _eta(started, fraction)
+        elif event.kind == "preview":
+            log.append(event.text)
+            fraction = event.fraction or fraction
+            video = event.path
+        elif event.kind == "done":
+            log.append(event.text)
+            yield (status_html("Done! " + event.text, 1.0, f"Saved to {event.path}", tone="ok"),
+                   event.path, log_html(log))
+            return
+        elif event.kind in ("error", "stopped"):
+            log.append(event.text)
+            tone = "warn" if event.kind == "stopped" else "error"
+            head = "Stopped." if event.kind == "stopped" else "Something went wrong."
+            detail = event.text.split("\n\n")[0] + ("  Press Resume to continue." if resume_hint else "")
+            yield status_html(head, fraction, detail, tone), video, log_html(log)
+            return
+        changed = changed or event is not None
+        # tqdm lines arrive many times a second; refresh the page at most twice a second.
+        now = time.time()
+        if changed and now - last_push >= 0.5:
+            detail = (eta + " · " if eta else "") + BACKGROUND_NOTE
+            yield status_html(title, fraction, detail), video, log_html(log)
+            video, changed, last_push = gr.skip(), False, now
 
 
 def generate(image, start_video, n, *rest):
@@ -239,6 +259,10 @@ def generate(image, start_video, n, *rest):
     if not model_ready(preset_key):
         yield (status_html("Download the model first: open the Models tab and press Download.", tone="warn"),
                None, gr.skip())
+        return
+    if active_job():
+        yield (status_html("Already working on another video — wait for it to finish or press Stop.", tone="warn"),
+               gr.skip(), gr.skip())
         return
     width, height = resolution(quality, aspect)
     model_dir, gemma_dir, upsampler = model_paths(preset_key)
@@ -256,13 +280,21 @@ def generate(image, start_video, n, *rest):
     except (ValueError, RuntimeError) as exc:
         yield status_html(str(exc), tone="error"), None, gr.skip()
         return
-    yield from _stream(project)
+    yield from _start(project, ["render"])
+
+
+def latest_project() -> str | None:
+    projects = engine.list_projects(PROJECTS_DIR)
+    return str(projects[0].dir) if projects else None
 
 
 def resume(project_dir, low_ram, fast_math, watchdog):
-    project_dir = project_dir or _state["last_project"]
+    project_dir = project_dir or _state["last_project"] or latest_project()
     if not project_dir:
         yield status_html("Nothing to resume yet.", tone="warn"), gr.skip(), gr.skip()
+        return
+    if active_job() == str(project_dir):  # still running in the background: just show it
+        yield from _watch(str(project_dir))
         return
     project = engine.Project.load(project_dir)
     if project.status == "complete":
@@ -273,7 +305,8 @@ def resume(project_dir, low_ram, fast_math, watchdog):
     s = project.settings
     s.low_ram, s.fast_math, s.gpu_watchdog_fix = bool(low_ram), bool(fast_math), bool(watchdog)
     s.offload = "disk" if low_ram else "cpu"
-    yield from _stream(project)
+    project.save()
+    yield from _start(project, ["render"])
 
 
 def upscale_project(project_dir, size, quality):
@@ -281,19 +314,28 @@ def upscale_project(project_dir, size, quality):
         yield status_html("Choose a project in the Projects tab first.", tone="warn"), gr.skip(), gr.skip()
         return
     project = engine.Project.load(project_dir)
-    yield from _stream(project, lambda runner: runner.upscale(size, quality), resume_hint=False)
+    yield from _start(project, ["upscale", "--size", size, "--quality", quality], resume_hint=False)
+
+
+def attach():
+    """On page load: show the job running in the background, or how the last one ended if that was recent."""
+    project_dir = active_job()
+    if project_dir:
+        _state["last_project"] = project_dir
+        job = _state["job"]
+        yield from _watch(project_dir, job[1] if job is not None and job[0] == project_dir else None)
+        return
+    events = sorted(PROJECTS_DIR.glob(f"*/{worker.EVENTS}"), key=lambda path: path.stat().st_mtime)
+    if events and time.time() - events[-1].stat().st_mtime < RECENT_SECONDS:
+        _state["last_project"] = str(events[-1].parent)
+        yield from _watch(str(events[-1].parent))
+        return
+    yield gr.skip(), gr.skip(), gr.skip()
 
 
 def is_busy() -> bool:
-    """True while a render, an upscale or a model download is running (the Mac app asks before quitting)."""
-    return _state["runner"] is not None or bool(_state.get("downloading"))
-
-
-def shutdown() -> None:
-    """Stop a running job; called when the app quits."""
-    runner = _state["runner"]
-    if runner is not None:
-        runner.cancel()
+    """True while a model download is running: quitting stops it (renders keep going on their own)."""
+    return bool(_state.get("downloading"))
 
 
 def resume_last(low_ram, fast_math, watchdog):
@@ -301,11 +343,13 @@ def resume_last(low_ram, fast_math, watchdog):
 
 
 def stop():
-    runner = _state["runner"]
-    if runner is None:
+    project_dir = active_job()
+    if project_dir is None:
         return status_html("Nothing is running.", tone="warn")
-    threading.Thread(target=runner.cancel, daemon=True).start()
-    return status_html("Stopping…", tone="warn", detail="The current segment is discarded; finished ones are kept.")
+    worker.request_stop(project_dir)
+    return status_html("Stopping…", tone="warn", detail=(
+        "The current segment is discarded; finished ones are kept." if ON_MAC else
+        "Resume renders the shot again from the start."))
 
 
 # ---------------------------------------------------------------------------
@@ -316,9 +360,16 @@ def stop():
 def project_choices() -> list[tuple[str, str]]:
     choices = []
     for p in engine.list_projects(PROJECTS_DIR):
-        label = f"{p.created.replace('T', ' ')[:16]} · {p.title[:60]} · {p.status} ({p.done}/{len(p.segments)})"
+        label = (f"{p.created.replace('T', ' ')[:16]} · {p.title[:60]} · {project_status(p)} "
+                 f"({p.done}/{len(p.segments)})")
         choices.append((label, str(p.dir)))
     return choices
+
+
+def project_status(p: engine.Project) -> str:
+    if p.status == "running" and not worker.is_running(p.dir):
+        return "interrupted"  # the render process ended without saying so (a crash or a restart)
+    return p.status
 
 
 def refresh_projects():
@@ -330,7 +381,7 @@ def show_project(project_dir):
     if not project_dir:
         return None, ""
     p = engine.Project.load(project_dir)
-    head = (f"**{p.title}**\n\nStatus: {p.status} · {p.done} of {len(p.segments)} segments · "
+    head = (f"**{p.title}**\n\nStatus: {project_status(p)} · {p.done} of {len(p.segments)} segments · "
             f"{p.settings.width}×{p.settings.height} · seed {p.settings.seed}\n")
     lines = [head] + [f"{i + 1}. ({s.seconds} s) {s.prompt}" for i, s in enumerate(p.segments)]
     files = [f.name for f in (p.output, p.upscaled("1080p"), p.upscaled("4k")) if f.exists()]
@@ -560,13 +611,16 @@ def build() -> gr.Blocks:
         example_btn.click(load_example, None, [n_segments, *prompts, *seconds], api_visibility="private")
 
         outputs = [status, video, log]
+        # The jobs run in their own processes; these handlers only start and follow them, so any number of
+        # windows can follow at once (concurrency_limit=None). Starting is guarded by active_job().
+        follow = dict(api_visibility="private", show_progress="hidden", concurrency_limit=None)
         go.click(generate,
                  [image, start_video, n_segments, *prompts, *seconds, preset, quality, aspect, low_ram, fast_math,
                   watchdog, anchor, seam, color_lock, seed, out_size, up_quality],
-                 outputs, api_visibility="private", show_progress="hidden")
+                 outputs, **follow)
         stop_btn.click(stop, None, status, api_visibility="private", queue=False)
-        resume_btn.click(resume_last, [low_ram, fast_math, watchdog], outputs, api_visibility="private",
-                         show_progress="hidden")
+        resume_btn.click(resume_last, [low_ram, fast_math, watchdog], outputs, **follow)
+        demo.load(attach, None, outputs, **follow)
         folder_btn.click(lambda: open_folder(_state["last_project"] or str(PROJECTS_DIR)), None, None,
                          api_visibility="private")
 
@@ -574,11 +628,10 @@ def build() -> gr.Blocks:
         project.change(show_project, project, [project_video, project_info], api_visibility="private")
         project_folder_btn.click(open_folder, project, None, api_visibility="private")
         resume_project_btn.click(lambda: gr.Tabs(selected="create"), None, tabs, api_visibility="private").then(
-            resume, [project, low_ram, fast_math, watchdog], outputs, api_visibility="private",
-            show_progress="hidden")
+            resume, [project, low_ram, fast_math, watchdog], outputs, **follow)
 
         upscale_btn.click(lambda: gr.Tabs(selected="create"), None, tabs, api_visibility="private").then(
-            upscale_project, [project, p_size, p_quality], outputs, api_visibility="private", show_progress="hidden")
+            upscale_project, [project, p_size, p_quality], outputs, **follow)
 
         dl_btn.click(download_models, dl_preset, [dl_status, table], api_visibility="private",
                      show_progress="hidden")
@@ -629,6 +682,9 @@ Optionally, the finished shot is then **upscaled to 1080p or 4K** with Real-ESRG
 
 After each segment you can watch the shot so far. If anything stops it (you, an error, the {COMPUTER} running out of
 memory), press **Resume**: {RESUME_NOTE}
+
+**Renders run in the background.** You can close the window or quit the app while a video is being made: it keeps
+going, and you get a notification when it's done. Open the app again to watch the progress or see the result.
 
 ### Speed and memory
 Everything runs on your {COMPUTER}'s GPU. A segment typically takes a few minutes; long, high-resolution segments take
