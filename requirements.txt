@@ -1,0 +1,5 @@
+# ltx-2-mlx (ltx-core-mlx + ltx-pipelines-mlx) is installed from vendor/ by install.command.
+gradio==6.30.0
+huggingface_hub
+numpy
+pillow

@@ -1,0 +1,517 @@
+"""TDPlay engine: chains LTX-2 segments into one continuous shot.
+
+Segment 1 is generated from its prompt (and the character photo, when there is one). Every later
+segment is an ``ltx-2-mlx extend --distilled`` run on the last 25 frames of the shot so far: the
+model gets those frames *and their sound* pinned at the start of its window and continues them.
+This is the "motion context" idea behind RunningHub's MiniMax H3 workflow, on open weights.
+
+Each model run happens in its own process. macOS kills a process that runs out of memory, and this
+way that costs one segment, not the app; the project can be resumed from where it stopped.
+
+The shot is stored as numbered chunks (H.264 video + WAV audio) plus a 25-frame "carry" tail that
+the next segment continues from. ``project.json`` records how far the run got, so an interrupted
+run resumes at the next segment.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import random
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Iterator
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+
+from tdplay import media
+
+#: Pixel frames ``extend --distilled`` pins from the source (ltx-2-mlx ``EXTEND_CARRY_PIXEL_FRAMES``).
+CARRY_FRAMES = 25
+FPS = 24
+#: Expected denoising steps per segment on the distilled path (8 at half resolution + 3 refine).
+DISTILLED_STEPS = 11
+SEAM_AUDIO_SECONDS = 0.05
+#: Largest per-channel color correction applied at a seam (0-255 scale).
+MAX_COLOR_SHIFT = 8.0
+MIN_SEGMENT_SECONDS = 1
+MAX_SEGMENT_SECONDS = 10
+
+
+def first_segment_frames(seconds: int, fps: int = FPS) -> int:
+    """Frame count for a generated (not extended) segment: on the 8k+1 grid, at least 2 s."""
+    latent = max(2 * fps // 8, round(seconds * fps / 8))
+    return 8 * latent + 1
+
+
+def extend_latent_frames(seconds: int, fps: int = FPS) -> int:
+    """Latent frames to append for an extended segment (each one is 8 pixel frames)."""
+    return max(1, round(seconds * fps / 8))
+
+
+@dataclass
+class Segment:
+    prompt: str
+    seconds: int
+
+
+@dataclass
+class Settings:
+    width: int
+    height: int
+    model_dir: str
+    gemma_dir: str | None = None
+    low_ram: bool = True
+    fast_math: bool = True
+    seed: int = -1
+    #: Strength of the character photo re-applied at the end of every extended segment (0 = off).
+    anchor_strength: float = 0.0
+    #: Frames over which the end of the previous segment is blended into the model's re-decode.
+    seam_frames: int = 8
+    #: Cancel the small color shift the VAE round trip adds at every seam.
+    color_lock: bool = True
+    #: Relax the macOS 26 GPU watchdog for the model process (``AGX_RELAX_CDM_CTXSTORE_TIMEOUT``).
+    gpu_watchdog_fix: bool = False
+    fps: int = FPS
+
+
+@dataclass
+class Project:
+    dir: Path
+    title: str
+    settings: Settings
+    segments: list[Segment]
+    seeds: list[int]
+    reference_image: str | None = None
+    start_video: str | None = None
+    #: Segments finished so far.
+    done: int = 0
+    #: Chunk files that make up the shot so far (the carry tail is not one of them).
+    chunks: int = 0
+    #: Whether the start video (if any) has been turned into chunks yet.
+    started: bool = False
+    status: str = "ready"
+    created: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+
+    # -- persistence ---------------------------------------------------------
+
+    def save(self) -> None:
+        data = asdict(self)
+        data.pop("dir")
+        tmp = self.dir / "project.json.tmp"
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(self.dir / "project.json")
+
+    @classmethod
+    def load(cls, directory: str | Path) -> Project:
+        directory = Path(directory)
+        data = json.loads((directory / "project.json").read_text())
+        data["settings"] = Settings(**data["settings"])
+        data["segments"] = [Segment(**s) for s in data["segments"]]
+        return cls(dir=directory, **data)
+
+    # -- layout ----------------------------------------------------------------
+
+    def path(self, *parts: str) -> Path:
+        return self.dir.joinpath(*parts)
+
+    def chunk(self, index: int, ext: str) -> Path:
+        return self.path("chunks", f"chunk_{index:03d}.{ext}")
+
+    def carry(self, step: int, kind: str) -> Path:
+        """Carry files after ``step`` finished steps: ``av.mp4`` (model input), ``v.mp4`` and ``wav``."""
+        return self.path("carry", f"carry_{step:03d}_{kind}")
+
+    @property
+    def carry_step(self) -> int:
+        """How many times a carry has been written: once for the start video, once per segment."""
+        return self.done + (1 if self.started else 0)
+
+    @property
+    def total_seconds(self) -> float:
+        fps = self.settings.fps
+        total = 0.0
+        for i, seg in enumerate(self.segments):
+            if i == 0 and not self.start_video:
+                total += first_segment_frames(seg.seconds, fps) / fps
+            else:
+                total += 8 * extend_latent_frames(seg.seconds, fps) / fps
+        return total
+
+    @property
+    def output(self) -> Path:
+        return self.path("render.mp4")
+
+    @property
+    def preview(self) -> Path:
+        return self.path("preview.mp4")
+
+
+def _slug(text: str, limit: int = 40) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:limit].rstrip("-") or "shot"
+
+
+def create_project(
+    root: str | Path,
+    settings: Settings,
+    segments: list[Segment],
+    *,
+    reference_image: str | None = None,
+    start_video: str | None = None,
+) -> Project:
+    """Make a new project folder under ``root`` (copies the inputs in, so the project is self-contained)."""
+    if not segments:
+        raise ValueError("Add at least one segment prompt.")
+    for i, seg in enumerate(segments, 1):
+        if not seg.prompt.strip():
+            raise ValueError(f"Segment {i} has no prompt.")
+        if not MIN_SEGMENT_SECONDS <= seg.seconds <= MAX_SEGMENT_SECONDS:
+            raise ValueError(f"Segment {i}: length must be {MIN_SEGMENT_SECONDS}-{MAX_SEGMENT_SECONDS} s.")
+    if segments[0].seconds < 2 and not start_video:
+        raise ValueError("The first segment must be at least 2 s (the next one continues its last second).")
+    if settings.width % 64 or settings.height % 64:
+        raise ValueError("Width and height must be multiples of 64.")
+
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    title = segments[0].prompt.strip().split("\n")[0][:80]
+    directory = Path(root) / f"{stamp}_{_slug(title)}"
+    for sub in ("segments", "chunks", "carry"):
+        (directory / sub).mkdir(parents=True, exist_ok=True)
+
+    base = settings.seed if settings.seed >= 0 else random.randrange(2**31 - 1000)
+    settings.seed = base
+    project = Project(
+        dir=directory,
+        title=title,
+        settings=settings,
+        segments=segments,
+        seeds=[base + i for i in range(len(segments))],
+    )
+    if reference_image:
+        from PIL import Image, ImageOps
+
+        with Image.open(reference_image) as img:
+            ImageOps.exif_transpose(img).convert("RGB").save(directory / "reference.png")
+        project.reference_image = "reference.png"
+    if start_video:
+        media.normalize_clip(start_video, directory / "start.mp4", settings.width, settings.height, settings.fps)
+        if media.probe(directory / "start.mp4").frames < CARRY_FRAMES:
+            raise ValueError(f"The start video needs at least {CARRY_FRAMES} frames (about 1 s).")
+        project.start_video = "start.mp4"
+    project.save()
+    return project
+
+
+@dataclass
+class Event:
+    """Something the UI should show: ``log`` line, ``progress``, a ``preview`` file, ``done``, ``error``, ``stopped``."""
+
+    kind: str
+    text: str = ""
+    fraction: float = 0.0
+    path: str | None = None
+
+
+class _Stopped(Exception):
+    pass
+
+
+class _SegmentFailed(Exception):
+    pass
+
+
+_TQDM = re.compile(r"(\d+)/(\d+) \[")
+
+
+def default_ltx_command() -> list[str]:
+    override = os.environ.get("TDPLAY_LTX_CMD")
+    return shlex.split(override) if override else [sys.executable, "-m", "ltx_pipelines_mlx"]
+
+
+class Runner:
+    """Runs (or resumes) one project. ``run()`` yields :class:`Event` objects; ``cancel()`` stops it."""
+
+    def __init__(self, project: Project, ltx_command: list[str] | None = None):
+        self.project = project
+        self.ltx_command = ltx_command or default_ltx_command()
+        self._stop = threading.Event()
+        self._proc: subprocess.Popen | None = None
+
+    # -- public ------------------------------------------------------------------
+
+    def cancel(self) -> None:
+        self._stop.set()
+        self._kill()
+
+    def run(self) -> Iterator[Event]:
+        p = self.project
+        p.status = "running"
+        p.save()
+        n = len(p.segments)
+        try:
+            carry = self._load_carry()
+            if p.start_video and not p.started:
+                yield Event("log", "Preparing the start video…")
+                frames = media.read_frames(p.path(p.start_video), p.settings.width, p.settings.height)
+                audio = media.fit_audio(media.read_audio(p.path(p.start_video)), self._samples(len(frames)))
+                carry = self._commit(frames, audio, finished_segment=False)
+                yield Event("preview", "Start video loaded.", path=str(self._assemble(p.preview)))
+
+            for i in range(p.done, n):
+                started = time.time()
+                yield Event("progress", f"Segment {i + 1} of {n}", fraction=i / n)
+                raw = p.path("segments", f"seg_{i + 1:02d}.mp4")
+                if i == 0 and not p.start_video:
+                    yield from self._cli(self._generate_args(i, raw), i, n)
+                    frames = media.read_frames(raw, p.settings.width, p.settings.height)
+                    audio = media.fit_audio(media.read_audio(raw), self._samples(len(frames)))
+                else:
+                    yield from self._cli(self._extend_args(i, raw, p.carry(p.carry_step, "av.mp4")), i, n)
+                    frames, audio = self._join(carry, raw)
+                carry = self._commit(frames, audio)
+                minutes = (time.time() - started) / 60
+                yield Event("log", f"Segment {i + 1} done in {minutes:.1f} min.")
+                yield Event("preview", f"Segment {i + 1} of {n} done.", fraction=(i + 1) / n,
+                            path=str(self._assemble(p.preview)))
+
+            final = self._assemble(p.output)
+            p.status = "complete"
+            p.save()
+            seconds = media.probe(final).frames / p.settings.fps
+            yield Event("done", f"Finished: {seconds:.1f} s in one continuous shot.", fraction=1.0, path=str(final))
+        except _Stopped:
+            p.status = "stopped"
+            p.save()
+            yield Event("stopped", f"Stopped after {p.done} of {n} segments. Resume any time.")
+        except GeneratorExit:
+            # The UI went away mid-run (e.g. the browser tab was closed): don't leave the model running.
+            self._stop.set()
+            self._kill()
+            p.status = "stopped"
+            p.save()
+            raise
+        except _SegmentFailed as exc:
+            p.status = "failed"
+            p.save()
+            yield Event("error", str(exc))
+        except Exception as exc:
+            p.status = "failed"
+            p.save()
+            yield Event("error", f"{type(exc).__name__}: {exc}")
+
+    # -- model runs ----------------------------------------------------------------
+
+    def _common_args(self, i: int, raw: Path) -> list[str]:
+        s = self.project.settings
+        # "--prompt=..." so a prompt that starts with "-" is not taken for an option.
+        args = ["--distilled", f"--prompt={self.project.segments[i].prompt.strip()}", "--output", str(raw),
+                "--model", s.model_dir, "--seed", str(self.project.seeds[i])]
+        if s.gemma_dir:
+            args += ["--gemma", s.gemma_dir]
+        if s.low_ram:
+            args.append("--low-ram")
+        return args
+
+    def _generate_args(self, i: int, raw: Path) -> list[str]:
+        p, s = self.project, self.project.settings
+        args = ["generate"] + self._common_args(i, raw)
+        args += ["--height", str(s.height), "--width", str(s.width),
+                 "--frames", str(first_segment_frames(p.segments[i].seconds, s.fps)), "--frame-rate", str(s.fps)]
+        if p.reference_image:
+            args += ["--image", str(p.path(p.reference_image))]
+        return args
+
+    def _extend_args(self, i: int, raw: Path, carry_av: Path) -> list[str]:
+        p, s = self.project, self.project.settings
+        args = ["extend"] + self._common_args(i, raw)
+        args += ["--video", str(carry_av), "--extend-frames", str(extend_latent_frames(p.segments[i].seconds, s.fps))]
+        if p.reference_image and s.anchor_strength > 0:
+            args += ["--image", str(p.path(p.reference_image)), "last", f"{s.anchor_strength:.2f}"]
+        return args
+
+    def _cli(self, args: list[str], i: int, n: int) -> Iterator[Event]:
+        if self._stop.is_set():
+            raise _Stopped
+        p = self.project
+        env = dict(os.environ, PYTHONUNBUFFERED="1", HF_HUB_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1")
+        if p.settings.fast_math:
+            env["LTX2_COMPUTE_DTYPE"] = "float16"
+        if p.settings.gpu_watchdog_fix:
+            env["AGX_RELAX_CDM_CTXSTORE_TIMEOUT"] = "1"
+        cmd = self.ltx_command + args
+        log_path = p.path("log.txt")
+        tail: list[str] = []
+        with log_path.open("a") as log:
+            log.write(f"\n$ {shlex.join(cmd)}\n")
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                                          cwd=p.dir, start_new_session=True)
+            # tqdm redraws with \r; split on both so every update becomes a line.
+            fd = self._proc.stdout.fileno()
+            buffer = b""
+            finished_steps, bar_total, bar_n = 0, 0, 0
+            while chunk := os.read(fd, 65536):
+                buffer += chunk
+                *lines, buffer = re.split(rb"[\r\n]", buffer)
+                for raw_line in lines:
+                    line = raw_line.decode(errors="replace").strip()
+                    if not line:
+                        continue
+                    log.write(line + "\n")
+                    tail = (tail + [line])[-15:]
+                    if m := _TQDM.search(line):
+                        step, total = int(m.group(1)), int(m.group(2))
+                        if total != bar_total or step < bar_n:
+                            finished_steps += bar_total if bar_n == bar_total else bar_n
+                            bar_total = total
+                        bar_n = step
+                        within = 0.05 + 0.85 * min(1.0, (finished_steps + step) / DISTILLED_STEPS)
+                        yield Event("progress", f"Segment {i + 1} of {n} · denoising step "
+                                    f"{min(DISTILLED_STEPS, finished_steps + step)}/{DISTILLED_STEPS}",
+                                    fraction=(i + within) / n)
+                    elif line.startswith("[Decoding"):
+                        yield Event("progress", f"Segment {i + 1} of {n} · decoding video + sound",
+                                    fraction=(i + 0.93) / n)
+                    else:
+                        yield Event("log", line)
+                log.flush()
+            code = self._proc.wait()
+        self._proc = None
+        if self._stop.is_set():
+            raise _Stopped
+        if code != 0:
+            hint = ""
+            if any("watchdog" in line.lower() or "ImpactingInteractivity" in line for line in tail):
+                hint = ("\n\nThe macOS GPU watchdog stopped the render. Turn on \"GPU watchdog workaround\" in "
+                        "Settings (and keep the display awake), then press Resume.")
+            elif code in (-signal.SIGKILL, 137):
+                hint = ("\n\nmacOS stopped the generator, most likely because it ran out of memory. "
+                        "Try a lower resolution or shorter segments, turn on Low-RAM mode, close other apps, "
+                        "then press Resume.")
+            raise _SegmentFailed(f"Segment {i + 1} failed (exit code {code}).{hint}\n\n" + "\n".join(tail))
+
+    def _kill(self) -> None:
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    # -- stitching -------------------------------------------------------------------
+
+    def _samples(self, frames: int) -> int:
+        return media.samples_for_frames(frames, self.project.settings.fps)
+
+    def _load_carry(self) -> tuple[np.ndarray, np.ndarray] | None:
+        p = self.project
+        if p.carry_step == 0:
+            return None
+        s = p.settings
+        frames = media.read_frames(p.carry(p.carry_step, "v.mp4"), s.width, s.height)
+        audio = media.read_wav(p.carry(p.carry_step, "wav"))
+        return frames, audio
+
+    def _join(self, carry: tuple[np.ndarray, np.ndarray], raw: Path) -> tuple[np.ndarray, np.ndarray]:
+        """Splice an extend output onto the carry tail it continued from.
+
+        The output starts with the model's own re-decode of the 25 carried frames; the new frames
+        follow it. The carry's last ``seam_frames`` frames are cross-faded into that re-decode, and
+        its audio is cross-faded into the re-decoded audio, so the cut is invisible and silent.
+        """
+        s = self.project.settings
+        carry_frames, carry_audio = carry[0].copy(), carry[1].copy()
+        t = len(carry_frames)
+        out = media.read_frames(raw, s.width, s.height)
+        out_audio = media.read_audio(raw)
+        if len(out) <= t:
+            raise _SegmentFailed(f"The model returned {len(out)} frames, expected more than {t}.")
+
+        if s.color_lock:
+            # Both means describe the same frames: the gap is the VAE round trip's color bias.
+            delta = carry_frames.reshape(-1, 3).mean(axis=0) - out[:t].reshape(-1, 3).mean(axis=0)
+            delta = np.clip(delta, -MAX_COLOR_SHIFT, MAX_COLOR_SHIFT)
+            luts = [np.clip(np.round(np.arange(256) + d), 0, 255).astype(np.uint8) for d in delta]
+            for frame in out[t - min(s.seam_frames, t):]:
+                for c in range(3):
+                    frame[..., c] = luts[c][frame[..., c]]
+
+        k = min(s.seam_frames, t)
+        for j in range(k):
+            a = (j + 1) / (k + 1)
+            idx = t - k + j
+            mixed = (1 - a) * carry_frames[idx].astype(np.float32) + a * out[idx].astype(np.float32)
+            carry_frames[idx] = np.clip(np.round(mixed), 0, 255).astype(np.uint8)
+
+        new_frames = out[t:]
+        cut = self._samples(t)
+        new_audio = media.fit_audio(out_audio[cut:], self._samples(len(new_frames)))
+        xf = min(int(SEAM_AUDIO_SECONDS * media.SAMPLE_RATE), cut, len(carry_audio), len(out_audio))
+        if xf > 0 and len(out_audio) >= cut:
+            ramp = np.linspace(0.0, 1.0, xf, dtype=np.float32)[:, None]
+            carry_audio[-xf:] = carry_audio[-xf:] * (1 - ramp) + out_audio[cut - xf:cut] * ramp
+
+        return np.concatenate([carry_frames, new_frames]), np.concatenate([carry_audio, new_audio])
+
+    def _commit(self, frames: np.ndarray, audio: np.ndarray, *, finished_segment: bool = True) -> tuple:
+        """Write everything but the last 25 frames as a chunk, keep those as the new carry, save state.
+
+        Files are written first and ``project.json`` last, so a crash part-way leaves the previous
+        state (and its carry files) intact and the segment simply runs again on resume.
+        """
+        p, fps = self.project, self.project.settings.fps
+        keep = max(0, len(frames) - CARRY_FRAMES)
+        split = self._samples(keep)
+        if keep:
+            tmp_v, tmp_a = p.chunk(p.chunks, "tmp.mp4"), p.chunk(p.chunks, "tmp.wav")
+            media.write_video(tmp_v, frames[:keep], fps)
+            media.write_wav(tmp_a, audio[:split])
+            tmp_v.replace(p.chunk(p.chunks, "mp4"))
+            tmp_a.replace(p.chunk(p.chunks, "wav"))
+        carry_frames, carry_audio = frames[keep:], audio[split:]
+        old_step = p.carry_step
+        step = old_step + 1
+        media.write_video(p.carry(step, "v.mp4"), carry_frames, fps)
+        media.write_wav(p.carry(step, "wav"), carry_audio)
+        media.write_video(p.carry(step, "av.mp4"), carry_frames, fps, crf=media.TAIL_CRF, audio=carry_audio)
+        if keep:
+            p.chunks += 1
+        if finished_segment:
+            p.done += 1
+        else:
+            p.started = True
+        p.save()
+        if old_step:
+            for kind in ("v.mp4", "wav", "av.mp4"):
+                p.carry(old_step, kind).unlink(missing_ok=True)
+        return carry_frames, carry_audio
+
+    def _assemble(self, out: Path) -> Path:
+        p = self.project
+        videos = [p.chunk(i, "mp4") for i in range(p.chunks)] + [p.carry(p.carry_step, "v.mp4")]
+        wavs = [p.chunk(i, "wav") for i in range(p.chunks)] + [p.carry(p.carry_step, "wav")]
+        media.assemble(videos, wavs, out)
+        return out
+
+
+def list_projects(root: str | Path) -> list[Project]:
+    root = Path(root)
+    projects = []
+    for path in sorted(root.glob("*/project.json"), reverse=True):
+        try:
+            projects.append(Project.load(path.parent))
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+    return projects
