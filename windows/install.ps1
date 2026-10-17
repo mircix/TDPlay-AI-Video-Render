@@ -74,7 +74,7 @@ $cpu = ((Get-CimInstance Win32_Processor | Select-Object -First 1).Name).Trim()
 $gpus = @(Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name })
 Write-Host "$cpu, $ramGB GB RAM"
 Write-Host ("Graphics: " + ($gpus -join ", "))
-if ($ramGB -lt 16) { Fail "TDPlay AI Video Render needs at least 16 GB of RAM (32 GB recommended)." }
+if ($ramGB -lt 16 -and -not $TestCpu) { Fail "TDPlay AI Video Render needs at least 16 GB of RAM (32 GB recommended)." }
 
 $target = Get-GpuTarget $gpus
 if ($TestCpu) {
