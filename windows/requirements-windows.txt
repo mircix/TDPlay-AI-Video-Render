@@ -1,0 +1,19 @@
+# Installed by windows/install.ps1 after PyTorch (from AMD's ROCm index, or CUDA) and Lightricks LTX-2 (--no-deps).
+# Lightricks LTX-2 v1.4.2 (ltx-core + ltx-pipelines) dependencies:
+einops
+colour-science
+av
+transformers>=5.8.0,<5.15
+safetensors
+accelerate
+scipy>=1.14
+tqdm
+openimageio
+cloudpickle>=3.1
+# the app
+gradio==6.30.0
+huggingface_hub
+numpy
+pillow
+pywebview==6.2.1
+spandrel

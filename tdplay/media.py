@@ -7,6 +7,7 @@ audio is ``float32 (samples, 2)`` stereo at :data:`SAMPLE_RATE`.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -23,17 +24,26 @@ CHANNELS = 2
 CHUNK_CRF = 14
 #: Quality of the tail clip handed to the model (near-lossless; it is only read back).
 TAIL_CRF = 8
+#: Keeps every ffmpeg / model process from opening a console window on Windows.
+NO_WINDOW: dict = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 
 def _bin(name: str) -> str:
     path = shutil.which(name)
+    if path is None and os.name == "nt":
+        # winget puts ffmpeg here; until the next sign-in, the app may not have it on its PATH yet.
+        links = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links"
+        if (links / f"{name}.exe").exists():
+            os.environ["PATH"] = f"{links}{os.pathsep}{os.environ.get('PATH', '')}"  # child processes too
+            path = str(links / f"{name}.exe")
     if path is None:
-        raise RuntimeError(f"{name} was not found. Install it with:  brew install ffmpeg")
+        install = "winget install Gyan.FFmpeg" if os.name == "nt" else "brew install ffmpeg"
+        raise RuntimeError(f"{name} was not found. Install it with:  {install}")
     return path
 
 
 def _run(cmd: list[str], *, stdin: bytes | None = None) -> bytes:
-    result = subprocess.run(cmd, input=stdin, capture_output=True, check=False)
+    result = subprocess.run(cmd, input=stdin, capture_output=True, check=False, **NO_WINDOW)
     if result.returncode != 0:
         tail = result.stderr.decode(errors="replace")[-2000:]
         raise RuntimeError(f"{Path(cmd[0]).name} failed ({result.returncode}):\n{tail}")

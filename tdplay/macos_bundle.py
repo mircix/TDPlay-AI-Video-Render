@@ -1,7 +1,7 @@
 """Build "TDPlay AI Video Render.app" so the app opens from Applications, Launchpad, Spotlight or the Dock.
 
 install.command runs ``python -m tdplay.macos_bundle``. The bundle is a small launcher: its executable
-is a shell script that runs ``python -m tdplay.mac_app`` from this install folder (output goes to
+is a shell script that runs ``python -m tdplay.desktop_app`` from this install folder (output goes to
 ``~/TDPlay/logs/app.log``). Run install.command again if you move the folder.
 
 The bundle is built on your Mac, so it carries no "downloaded from the internet" flag and opens
@@ -44,7 +44,7 @@ if [[ ! -x "${{APP_HOME}}/.venv/bin/python" ]]; then
 fi
 cd "${{APP_HOME}}" || exit 1
 echo "--- $(date) ---" >> "${{LOG_DIR}}/app.log"
-exec "${{APP_HOME}}/.venv/bin/python" -m tdplay.mac_app >> "${{LOG_DIR}}/app.log" 2>&1
+exec "${{APP_HOME}}/.venv/bin/python" -m tdplay.desktop_app >> "${{LOG_DIR}}/app.log" 2>&1
 """
 
 

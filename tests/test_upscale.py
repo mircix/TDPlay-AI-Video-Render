@@ -91,6 +91,18 @@ def test_mlx_network_matches_pytorch(weights_home):
     assert np.abs(mine - ref[0].permute(1, 2, 0).numpy()).max() < 1e-4
 
 
+def test_mac_and_windows_upscalers_agree(weights_home):
+    pytest.importorskip("spandrel")
+    import mlx.core as mx
+
+    from tdplay import upscale
+
+    rgb = (np.random.default_rng(2).random((20, 28, 3)) * 255).astype(np.uint8)
+    on_mac = upscale.Upscaler("fast", dtype=mx.float32).frame(rgb).astype(int)
+    on_windows = upscale.TorchUpscaler("fast").frame(rgb).astype(int)
+    assert np.abs(on_mac - on_windows).max() <= 1
+
+
 def test_tiles_join_without_visible_seams(weights_home):
     import mlx.core as mx
 

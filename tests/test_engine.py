@@ -167,6 +167,15 @@ def test_closing_the_stream_kills_the_model_process(tmp_path, monkeypatch):
     assert engine.Project.load(project.dir).status == "stopped"
 
 
+def test_helper_modules_run_from_the_project_folder(tmp_path, monkeypatch):
+    # The upscaler and the Windows backend run as ``python -m tdplay.<module>`` inside the project folder.
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    project = engine.create_project(tmp_path, make_settings(), [Segment("a", 2)])
+    runner = engine.Runner(project, FAKE)
+    lines = list(runner._process([sys.executable, "-m", "tdplay.upscale", "--help"], dict(os.environ), "Upscaling"))
+    assert any("usage" in line for line in lines), lines
+
+
 def test_validation(tmp_path):
     with pytest.raises(ValueError, match="no prompt"):
         engine.create_project(tmp_path, make_settings(), [Segment("  ", 3)])

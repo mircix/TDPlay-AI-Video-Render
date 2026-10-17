@@ -44,6 +44,8 @@ SEAM_AUDIO_SECONDS = 0.05
 MAX_COLOR_SHIFT = 8.0
 MIN_SEGMENT_SECONDS = 1
 MAX_SEGMENT_SECONDS = 10
+#: The app folder. Helper processes run inside the project folder, so ``-m tdplay.*`` needs it on PYTHONPATH.
+APP_ROOT = Path(__file__).resolve().parent.parent
 
 
 def first_segment_frames(seconds: int, fps: int = FPS) -> int:
@@ -84,6 +86,12 @@ class Settings:
     upscale: str = "off"
     #: Upscaler model: "fast" or "best".
     upscale_quality: str = "fast"
+    #: "mlx" (Mac, segment by segment) or "torch" (Windows/Linux, whole shot in one LTX-2 run).
+    backend: str = "mlx"
+    #: torch backend: LTX-2's latent upscaler checkpoint, and where weights live while rendering
+    #: ("disk": stream from disk, ~5 GB RAM; "cpu": keep in RAM, ~36 GB RAM).
+    upsampler: str | None = None
+    offload: str = "disk"
     fps: int = FPS
 
 
@@ -187,6 +195,8 @@ def create_project(
         raise ValueError("The first segment must be at least 2 s (the next one continues its last second).")
     if settings.width % 64 or settings.height % 64:
         raise ValueError("Width and height must be multiples of 64.")
+    if start_video and settings.backend == "torch":
+        raise ValueError("Continuing an existing video isn't available in the Windows version yet.")
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     title = segments[0].prompt.strip().split("\n")[0][:80]
@@ -237,6 +247,28 @@ class _SegmentFailed(Exception):
 
 
 _TQDM = re.compile(r"(\d+)/(\d+) \[")
+_OUT_OF_MEMORY = re.compile(r"out of memory|OutOfMemoryError|HIP error: out|insufficient memory", re.IGNORECASE)
+
+
+class _StepCounter:
+    """Turns tqdm denoising bars (8 half-resolution + 3 refine steps per segment) into progress."""
+
+    def __init__(self) -> None:
+        self.finished, self.total, self.n = 0, 0, 0
+
+    def reset(self) -> None:
+        self.finished, self.total, self.n = 0, 0, 0
+
+    def update(self, line: str) -> int | None:
+        """Steps done in the current segment, or ``None`` if ``line`` is not a tqdm update."""
+        if not (m := _TQDM.search(line)):
+            return None
+        step, total = int(m.group(1)), int(m.group(2))
+        if total != self.total or step < self.n:  # a new bar started
+            self.finished += self.total if self.n == self.total else self.n
+            self.total = total
+        self.n = step
+        return min(DISTILLED_STEPS, self.finished + step)
 
 
 def default_ltx_command() -> list[str]:
@@ -273,34 +305,8 @@ class Runner:
         p = self.project
         p.status = "running"
         p.save()
-        n = len(p.segments)
         try:
-            carry = self._load_carry()
-            if p.start_video and not p.started:
-                yield Event("log", "Preparing the start video…")
-                frames = media.read_frames(p.path(p.start_video), p.settings.width, p.settings.height)
-                audio = media.fit_audio(media.read_audio(p.path(p.start_video)), self._samples(len(frames)))
-                carry = self._commit(frames, audio, finished_segment=False)
-                yield Event("preview", "Start video loaded.", path=str(self._assemble(p.preview)))
-
-            for i in range(p.done, n):
-                started = time.time()
-                yield Event("progress", f"Segment {i + 1} of {n}", fraction=i / n)
-                raw = p.path("segments", f"seg_{i + 1:02d}.mp4")
-                if i == 0 and not p.start_video:
-                    yield from self._cli(self._generate_args(i, raw), i, n)
-                    frames = media.read_frames(raw, p.settings.width, p.settings.height)
-                    audio = media.fit_audio(media.read_audio(raw), self._samples(len(frames)))
-                else:
-                    yield from self._cli(self._extend_args(i, raw, p.carry(p.carry_step, "av.mp4")), i, n)
-                    frames, audio = self._join(carry, raw)
-                carry = self._commit(frames, audio)
-                minutes = (time.time() - started) / 60
-                yield Event("log", f"Segment {i + 1} done in {minutes:.1f} min.")
-                yield Event("preview", f"Segment {i + 1} of {n} done.", fraction=(i + 1) / n,
-                            path=str(self._assemble(p.preview)))
-
-            final = self._assemble(p.output)
+            final = yield from self._render()
             seconds = media.probe(final).frames / p.settings.fps
             if p.settings.upscale != "off":
                 yield Event("preview", f"Shot finished ({seconds:.1f} s). Upscaling…", fraction=1.0, path=str(final))
@@ -311,7 +317,7 @@ class Runner:
         except _Stopped:
             p.status = "stopped"
             p.save()
-            yield Event("stopped", f"Stopped after {p.done} of {n} segments. Resume any time.")
+            yield Event("stopped", self._stopped_text())
         except GeneratorExit:
             # The UI went away mid-run (e.g. the browser tab was closed): don't leave the model running.
             self._stop.set()
@@ -327,6 +333,40 @@ class Runner:
             p.status = "failed"
             p.save()
             yield Event("error", f"{type(exc).__name__}: {exc}")
+
+    def _stopped_text(self) -> str:
+        return f"Stopped after {self.project.done} of {len(self.project.segments)} segments. Resume any time."
+
+    def _render(self):
+        """Render the remaining segments (Mac: one ltx-2-mlx run per segment); return the shot's path."""
+        p = self.project
+        n = len(p.segments)
+        carry = self._load_carry()
+        if p.start_video and not p.started:
+            yield Event("log", "Preparing the start video…")
+            frames = media.read_frames(p.path(p.start_video), p.settings.width, p.settings.height)
+            audio = media.fit_audio(media.read_audio(p.path(p.start_video)), self._samples(len(frames)))
+            carry = self._commit(frames, audio, finished_segment=False)
+            yield Event("preview", "Start video loaded.", path=str(self._assemble(p.preview)))
+
+        for i in range(p.done, n):
+            started = time.time()
+            yield Event("progress", f"Segment {i + 1} of {n}", fraction=i / n)
+            raw = p.path("segments", f"seg_{i + 1:02d}.mp4")
+            if i == 0 and not p.start_video:
+                yield from self._cli(self._generate_args(i, raw), i, n)
+                frames = media.read_frames(raw, p.settings.width, p.settings.height)
+                audio = media.fit_audio(media.read_audio(raw), self._samples(len(frames)))
+            else:
+                yield from self._cli(self._extend_args(i, raw, p.carry(p.carry_step, "av.mp4")), i, n)
+                frames, audio = self._join(carry, raw)
+            carry = self._commit(frames, audio)
+            minutes = (time.time() - started) / 60
+            yield Event("log", f"Segment {i + 1} done in {minutes:.1f} min.")
+            yield Event("preview", f"Segment {i + 1} of {n} done.", fraction=(i + 1) / n,
+                        path=str(self._assemble(p.preview)))
+
+        return self._assemble(p.output)
 
     def upscale(self, size: str, quality: str = "fast") -> Iterator[Event]:
         """Upscale an already finished project (Projects tab)."""
@@ -403,17 +443,11 @@ class Runner:
             env["LTX2_COMPUTE_DTYPE"] = "float16"
         if p.settings.gpu_watchdog_fix:
             env["AGX_RELAX_CDM_CTXSTORE_TIMEOUT"] = "1"
-        finished_steps, bar_total, bar_n = 0, 0, 0
+        steps = _StepCounter()
         for line in self._process(self.ltx_command + args, env, f"Segment {i + 1}"):
-            if m := _TQDM.search(line):
-                step, total = int(m.group(1)), int(m.group(2))
-                if total != bar_total or step < bar_n:
-                    finished_steps += bar_total if bar_n == bar_total else bar_n
-                    bar_total = total
-                bar_n = step
-                within = 0.05 + 0.85 * min(1.0, (finished_steps + step) / DISTILLED_STEPS)
-                yield Event("progress", f"Segment {i + 1} of {n} · denoising step "
-                            f"{min(DISTILLED_STEPS, finished_steps + step)}/{DISTILLED_STEPS}",
+            if (done := steps.update(line)) is not None:
+                within = 0.05 + 0.85 * done / DISTILLED_STEPS
+                yield Event("progress", f"Segment {i + 1} of {n} · denoising step {done}/{DISTILLED_STEPS}",
                             fraction=(i + within) / n)
             elif line.startswith("[Decoding"):
                 yield Event("progress", f"Segment {i + 1} of {n} · decoding video + sound", fraction=(i + 0.93) / n)
@@ -428,10 +462,11 @@ class Runner:
         if self._stop.is_set():
             raise _Stopped
         tail: list[str] = []
+        env = dict(env, PYTHONPATH=os.pathsep.join(filter(None, [str(APP_ROOT), env.get("PYTHONPATH")])))
         with self.project.path("log.txt").open("a") as log:
             log.write(f"\n$ {shlex.join(cmd)}\n")
             self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
-                                          cwd=self.project.dir, start_new_session=True)
+                                          cwd=self.project.dir, start_new_session=os.name != "nt", **media.NO_WINDOW)
             # tqdm redraws with \r; split on both so every update becomes a line.
             fd = self._proc.stdout.fileno()
             buffer = b""
@@ -454,15 +489,17 @@ class Runner:
             if any("watchdog" in line.lower() or "ImpactingInteractivity" in line for line in tail):
                 hint = ("\n\nThe macOS GPU watchdog stopped the render. Turn on \"GPU watchdog workaround\" in "
                         "Settings (and keep the display awake), then press Resume.")
-            elif code in (-signal.SIGKILL, 137):
-                hint = ("\n\nmacOS stopped it, most likely because the Mac ran out of memory. "
-                        "Try a lower resolution or shorter segments, turn on Low-RAM mode, close other apps, "
-                        "then press Resume.")
+            elif code in (-getattr(signal, "SIGKILL", 9), 137) or any(_OUT_OF_MEMORY.search(line) for line in tail):
+                hint = ("\n\nIt ran out of memory. Try a lower resolution or shorter segments, use the low-memory "
+                        "setting (Low-RAM mode / stream from disk), close other apps, then press Resume.")
             raise _SegmentFailed(f"{what} failed (exit code {code}).{hint}\n\n" + "\n".join(tail))
 
     def _kill(self) -> None:
         proc = self._proc
         if proc is None or proc.poll() is not None:
+            return
+        if os.name == "nt":  # no process groups: end the whole tree (the model may have started ffmpeg)
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, **media.NO_WINDOW)
             return
         try:
             os.killpg(proc.pid, signal.SIGTERM)

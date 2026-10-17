@@ -1,4 +1,4 @@
-"""Upscale a finished video to 1080p or 4K with Real-ESRGAN, running on the Mac's GPU through MLX.
+"""Upscale a finished video to 1080p or 4K with Real-ESRGAN on the GPU (MLX on a Mac, PyTorch elsewhere).
 
 Two models (weights from the mlx-community MLX ports of the official Real-ESRGAN releases, BSD-3):
 
@@ -15,6 +15,7 @@ Runs as its own process (``python -m tdplay.upscale IN OUT --width W --height H`
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -58,11 +59,73 @@ def weights_path(quality: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Networks (NHWC; conv weights are stored as (out, kh, kw, in), the MLX layout)
+# Networks (the weight files store convolutions as (out, kh, kw, in), the MLX layout)
 # ---------------------------------------------------------------------------
 
 
-class Upscaler:
+class _Tiled:
+    """Shared frame handling: each backend supplies ``_run(rgb) -> float32 (4H, 4W, 3) in [0, 1]``."""
+
+    tile = 0
+
+    def _run(self, rgb: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    def frame(self, rgb: np.ndarray) -> np.ndarray:
+        """Upscale one ``(H, W, 3) uint8`` frame 4x, in tiles when the model needs them."""
+        h, w = rgb.shape[:2]
+        if not self.tile or (h <= self.tile and w <= self.tile):
+            out = self._run(rgb)
+        else:
+            out = np.empty((h * SCALE, w * SCALE, 3), np.float32)
+            t, p = self.tile, TILE_PAD
+            for y0 in range(0, h, t):
+                for x0 in range(0, w, t):
+                    y1, x1 = min(y0 + t, h), min(x0 + t, w)
+                    # Each tile sees TILE_PAD pixels of context on every side; only its own area is kept.
+                    py0, px0, py1, px1 = max(0, y0 - p), max(0, x0 - p), min(h, y1 + p), min(w, x1 + p)
+                    tile = self._run(rgb[py0:py1, px0:px1])
+                    oy, ox = (y0 - py0) * SCALE, (x0 - px0) * SCALE
+                    out[y0 * SCALE:y1 * SCALE, x0 * SCALE:x1 * SCALE] = tile[oy:oy + (y1 - y0) * SCALE,
+                                                                             ox:ox + (x1 - x0) * SCALE]
+        return np.round(out * 255.0).astype(np.uint8)
+
+
+class TorchUpscaler(_Tiled):
+    """Real-ESRGAN through PyTorch (spandrel), on an AMD (ROCm) or NVIDIA GPU, else the CPU."""
+
+    def __init__(self, quality: str = "fast"):
+        import spandrel
+        import torch
+        from safetensors.numpy import load_file
+
+        self.torch = torch
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        # Same weight files as the MLX path; convolutions go back to PyTorch's (out, in, kh, kw).
+        state = {k: torch.from_numpy((v.transpose(0, 3, 1, 2) if v.ndim == 4 else v).astype(np.float32))
+                 for k, v in load_file(str(weights_path(quality))).items()}
+        self.model = spandrel.ModelLoader().load_from_state_dict(state).model.eval().to(self.device, self.dtype)
+        self.tile = TILE[quality]
+
+    def _run(self, rgb: np.ndarray) -> np.ndarray:
+        torch = self.torch
+        # frames read from ffmpeg are read-only buffers, which PyTorch can't share: copy first
+        x = torch.as_tensor(np.array(rgb), device=self.device).permute(2, 0, 1)[None].to(self.dtype) / 255.0
+        with torch.inference_mode():
+            y = self.model(x).clamp_(0.0, 1.0)
+        return y[0].permute(1, 2, 0).float().cpu().numpy()
+
+
+def make_upscaler(quality: str = "fast") -> _Tiled:
+    """MLX on a Mac, PyTorch everywhere else (``TDPLAY_UPSCALE_BACKEND=mlx|torch`` overrides)."""
+    backend = os.environ.get("TDPLAY_UPSCALE_BACKEND") or ("mlx" if sys.platform == "darwin" else "torch")
+    return Upscaler(quality) if backend == "mlx" else TorchUpscaler(quality)
+
+
+class Upscaler(_Tiled):
+    """Real-ESRGAN in MLX, on the Mac's GPU."""
+
     def __init__(self, quality: str = "fast", dtype=None):
         import mlx.core as mx
 
@@ -136,24 +199,6 @@ class Upscaler:
         mx.eval(y)
         return np.asarray(y[0].astype(mx.float32))
 
-    def frame(self, rgb: np.ndarray) -> np.ndarray:
-        """Upscale one ``(H, W, 3) uint8`` frame 4x, in tiles when the model needs them."""
-        h, w = rgb.shape[:2]
-        if not self.tile or (h <= self.tile and w <= self.tile):
-            out = self._run(rgb)
-        else:
-            out = np.empty((h * SCALE, w * SCALE, 3), np.float32)
-            t, p = self.tile, TILE_PAD
-            for y0 in range(0, h, t):
-                for x0 in range(0, w, t):
-                    y1, x1 = min(y0 + t, h), min(x0 + t, w)
-                    # Each tile sees TILE_PAD pixels of context on every side; only its own area is kept.
-                    py0, px0, py1, px1 = max(0, y0 - p), max(0, x0 - p), min(h, y1 + p), min(w, x1 + p)
-                    tile = self._run(rgb[py0:py1, px0:px1])
-                    oy, ox = (y0 - py0) * SCALE, (x0 - px0) * SCALE
-                    out[y0 * SCALE:y1 * SCALE, x0 * SCALE:x1 * SCALE] = tile[oy:oy + (y1 - y0) * SCALE,
-                                                                             ox:ox + (x1 - x0) * SCALE]
-        return np.round(out * 255.0).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +208,7 @@ class Upscaler:
 
 def _encoder_args(width: int, height: int) -> list[str]:
     encoders = subprocess.run([shutil.which("ffmpeg") or "ffmpeg", "-hide_banner", "-encoders"],
-                              capture_output=True, text=True).stdout
+                              capture_output=True, text=True, **media.NO_WINDOW).stdout
     four_k = width * height > 2_500_000
     if four_k and "hevc_videotoolbox" in encoders:  # the Mac's hardware encoder
         return ["-c:v", "hevc_videotoolbox", "-b:v", "45M", "-tag:v", "hvc1", "-pix_fmt", "yuv420p"]
@@ -176,19 +221,19 @@ def upscale_video(src: str | Path, dst: str | Path, width: int, height: int, qua
                   report=lambda done, total: None) -> Path:
     src, dst = Path(src), Path(dst)
     info = media.probe(src)
-    model = Upscaler(quality)
+    model = make_upscaler(quality)
     sw, sh = info.width * SCALE, info.height * SCALE
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
     reader = subprocess.Popen(
         [ffmpeg, "-v", "error", "-i", str(src), "-map", "0:v:0", "-fps_mode", "passthrough",
-         "-pix_fmt", "rgb24", "-f", "rawvideo", "-"], stdout=subprocess.PIPE)
+         "-pix_fmt", "rgb24", "-f", "rawvideo", "-"], stdout=subprocess.PIPE, **media.NO_WINDOW)
     tmp = dst.with_name(f".{dst.stem}_tmp{dst.suffix}")
     vf = f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,crop={width}:{height},setsar=1"
     writer = subprocess.Popen(
         [ffmpeg, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{sw}x{sh}",
          "-r", f"{info.fps:g}", "-i", "-", "-i", str(src), "-map", "0:v", "-map", "1:a?", "-vf", vf,
          *_encoder_args(width, height), "-c:a", "copy", "-movflags", "+faststart", str(tmp)],
-        stdin=subprocess.PIPE)
+        stdin=subprocess.PIPE, **media.NO_WINDOW)
     frame_bytes = info.width * info.height * 3
     done = 0
     try:

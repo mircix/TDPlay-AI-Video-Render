@@ -1,14 +1,18 @@
 # TDPlay AI Video Render 🎬
 
-**One continuous AI video shot, built segment by segment — free, private, on your Mac.**
+**One continuous AI video shot, built segment by segment — free, private, on your Mac or Windows PC.**
 
 TDPlay AI Video Render is a local take on RunningHub's *MINIMAX H3 Motion Context* workflow. You write one prompt per
 segment. Each new segment continues the last second of the one before it, **picture and sound together**,
 so the result plays as a single unbroken take of 30, 45, 60+ seconds instead of a set of cuts.
 
 It runs the open-weights **LTX-2** video model from Lightricks (which makes video *with* audio) natively on Apple
-Silicon through [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx). No account, no credits, no upload: after the
-one-time model download everything runs offline on your Mac.
+Silicon through [ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx), and on Windows PCs with an AMD Radeon RX 7000 /
+RX 9000 card through Lightricks' own PyTorch code and AMD ROCm. No account, no credits, no upload: after the
+one-time model download everything runs offline on your computer.
+
+> **Windows is new (beta).** The Mac version is the main one. The Windows version has been tested against the real
+> LTX-2 code but not yet on a real Radeon card; see [Windows](#windows-amd-radeon-rx-7000--rx-9000).
 
 ---
 
@@ -22,7 +26,7 @@ one-time model download everything runs offline on your Mac.
 | Disk | 30–45 GB for the model, plus space for your videos |
 | Internet | only for installing and the one-time model download |
 
-## Install (once)
+## Install on a Mac (once)
 
 1. Get the `TDPlay-AI-Video-Render` folder (clone it from GitHub, or unzip `TDPlay-AI-Video-Render.zip`) and keep it
    somewhere permanent, for example your home folder or your Claude Workspace folder.
@@ -104,6 +108,63 @@ chips should be faster. The app keeps the Mac from idle-sleeping while it is ope
 * **Seam blend** and **Color lock** hide the joins (cross-fade + color correction). Leave them on.
 * **Seed**: −1 for a random one. The seed of every project is saved, so you can repeat a run.
 
+## Windows (AMD Radeon RX 7000 / RX 9000)
+
+| | |
+|---|---|
+| Windows | **Windows 11** (AMD's PyTorch for Windows is made for it), with a current **AMD Adrenalin** driver |
+| Graphics card | **Radeon RX 7900 XTX / XT / GRE**, RX 7800 XT, RX 7700 XT, RX 7600 · **RX 9070 XT / 9070**, RX 9060 XT, Radeon AI PRO R9700. NVIDIA RTX cards work too (CUDA). |
+| CPU | any recent AMD Ryzen or Intel (the GPU does the work) |
+| Memory | 16 GB minimum, **32 GB recommended** |
+| Disk | about **70 GB** (55 GB model + PyTorch), plus space for your videos. An SSD helps a lot. |
+
+A 24 GB card (RX 7900 XTX, AI PRO R9700) is the best fit. 16 GB cards (RX 7800 XT, RX 9070 XT, RX 9060 XT) work at
+the lower resolutions. 8–12 GB cards are likely too small.
+
+### Install on Windows (once)
+
+1. Get the `TDPlay-AI-Video-Render` folder (clone it, or unzip the zip) and keep it somewhere permanent, for example
+   `C:\TDPlay-AI-Video-Render`. Avoid OneDrive-synced folders: the install is several GB.
+2. Double-click **`install.bat`**.
+   * If Windows says "Windows protected your PC": **More info** → **Run anyway**.
+   * The installer finds your graphics card and installs [uv](https://docs.astral.sh/uv/) (which installs Python
+     3.13), ffmpeg (via winget), Lightricks' LTX-2 code, and **AMD's ROCm PyTorch for your card** (RX 7900 →
+     `gfx1100`, RX 7800/7700 → `gfx1101`, RX 7600 → `gfx1102`, RX 9060 → `gfx1200`, RX 9070 / R9700 → `gfx1201`).
+     It then checks that PyTorch can see the GPU.
+   * It adds **TDPlay AI Video Render** to the Start menu and the desktop, and offers to download the model
+     (about 55 GB). You can also do that later in the app's **Models** tab.
+3. Open **TDPlay AI Video Render** from the Start menu or the desktop. It opens in its own window, in dark or light
+   mode like Windows. If a video is still being made when you close it, it asks first.
+   * `start.bat` opens the same app in your web browser, with a window showing the log.
+
+### Recommended settings on Windows
+
+The app picks these for you: **LTX-2.3 distilled, 8-bit** (official Lightricks weights, ≈ 55 GB with the Gemma 3
+text encoder), **576p**, segments **up to 5 s**. With less than 48 GB of RAM, *Low-RAM mode* is on: the model's
+weights stream from the SSD instead of being held in memory, which is what makes 32 GB of RAM work. 704p
+(1280×704) is worth trying on a 24 GB card.
+
+### How the Windows version differs
+
+* **The whole shot is one model run.** Every segment is one chunk of LTX-2's own long-video mode: the last 25 frames
+  of a segment and the sound under them are pinned at the start of the next one, and LTX-2 cross-fades the overlap.
+  It is the same continuation the Mac version does segment by segment. You still see the shot grow after every
+  segment.
+* **Resume starts the shot over.** The carry between segments lives inside the model run, so a stopped shot is
+  rendered again from the beginning (with the same seed).
+* **No "continue a video you already have"** yet. A start photo works.
+* **1080p / 4K upscaling** works the same way, with Real-ESRGAN on the GPU through PyTorch.
+* **Speed is not measured yet.** Your first run is the benchmark; the log shows every step.
+
+### Troubleshooting on Windows
+
+* **"The GPU check failed"** → update the AMD Adrenalin driver, restart Windows, run `install.bat` again.
+* **"ran out of memory"** → keep Low-RAM mode on, lower the resolution, use shorter or fewer segments, close other
+  apps (games and browsers especially), then **Resume**.
+* **"ffmpeg was installed but Windows can't find it yet"** → sign out and back in, run `install.bat` again.
+* **The full log** is `log.txt` in each project folder. The app's own log is `%USERPROFILE%\TDPlay\logs\app.log`.
+* **Moved the folder?** Run `install.bat` again so the shortcuts point to it.
+
 ## How it works
 
 ```
@@ -159,13 +220,14 @@ H3 is a larger cloud model. Expect LTX-2 on a laptop to be good but not identica
 * Projects: `~/TDPlay/projects/<date>_<title>/render.mp4` (plus `render_1080p.mp4` / `render_4k.mp4` if upscaled)
 * Models: `~/TDPlay/models/` (delete a folder there to free its space)
 * App code: this folder (`.venv/` and `vendor/` are created by the installer)
+* On Windows, `~` is your user folder (`C:\Users\<you>`), and the app is a Start menu / desktop shortcut.
 
 ## Update or uninstall
 
-* **Update**: `git pull` in this folder (or replace it with a new version), then run `install.command` again.
-  Models and projects stay in `~/TDPlay`.
+* **Update**: `git pull` in this folder (or replace it with a new version), then run `install.command` again
+  (`install.bat` on Windows). Models and projects stay in `~/TDPlay`.
 * **Uninstall**: delete the app from Applications, this folder, and `~/TDPlay`. ffmpeg and uv can be removed with
-  `brew uninstall ffmpeg uv`.
+  `brew uninstall ffmpeg uv`. On Windows: delete the shortcuts, this folder and `%USERPROFILE%\TDPlay`.
 
 ## Credits and licenses
 
@@ -175,7 +237,12 @@ H3 is a larger cloud model. Expect LTX-2 on a laptop to be good but not identica
   an acceptable-use policy. Read it before any commercial use.
 * **[ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx)** (MIT) by dgrauet: the MLX port and the pre-converted weights
   (`dgrauet/ltx-2.x-mlx-*` on Hugging Face). TDPlay AI Video Render pins release `v0.16.3`.
-* **Gemma 3** (`mlx-community/gemma-3-12b-it-4bit`) is the text encoder for the LTX-2.3 packs, under the Gemma terms.
+* **[LTX-2](https://github.com/Lightricks/LTX-2)** code by Lightricks, release `v1.4.2`, runs the Windows version, with
+  the official `Lightricks/LTX-2.3-fp8` weights. Code and weights are under the same LTX-2 Community License.
+* **Gemma 3** (`mlx-community/gemma-3-12b-it-4bit` on Mac, `Lightricks/gemma-3-12b-it-qat-q4_0-unquantized` on
+  Windows) is the text encoder, under the Gemma terms.
+* **[PyTorch](https://pytorch.org)** (BSD-3-Clause) with **AMD ROCm** on Windows, and
+  **[spandrel](https://github.com/chaiNNer-org/spandrel)** (MIT) for Real-ESRGAN there.
 * **[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)** (BSD-3-Clause) by Xintao Wang et al. for upscaling,
   using the MLX conversions `mlx-community/Real-ESRGAN-general-x4v3` and `mlx-community/Real-ESRGAN-x4plus`.
 * **[Gradio](https://gradio.app)** (Apache-2.0) for the interface, **[pywebview](https://pywebview.flowrl.com)**
@@ -187,7 +254,7 @@ H3 is a larger cloud model. Expect LTX-2 on a laptop to be good but not identica
 
 ```bash
 .venv/bin/python -m tdplay                 # start the UI in the browser (TDPLAY_PORT, TDPLAY_NO_BROWSER, TDPLAY_HOME)
-.venv/bin/python -m tdplay.mac_app         # the same UI in its own window (what the .app runs)
+.venv/bin/python -m tdplay.desktop_app    # the same UI in its own window (what the .app runs)
 .venv/bin/python -m tdplay download        # download the recommended model (or: download ltx-2.3-q4)
 .venv/bin/python -m tdplay.upscale IN.mp4 OUT.mp4 --width 3840 --height 2160 --quality fast
 .venv/bin/python -m tdplay.macos_bundle    # (re)build the app in /Applications
@@ -202,6 +269,13 @@ resuming after an out-of-memory kill, stop/resume and continuing an existing vid
 the original PyTorch Real-ESRGAN (`tests/test_upscale.py`), and the app launcher is run under bash 3.2, the version
 macOS uses (`tests/test_macos_bundle.py`; set `TDPLAY_BASH32` to a bash 3.2 binary to include it).
 
-Layout: `tdplay/engine.py` (segment chaining, joins, resume) · `tdplay/media.py` (ffmpeg I/O) ·
-`tdplay/models.py` (presets, downloads) · `tdplay/upscale.py` (Real-ESRGAN on MLX) · `tdplay/app.py` (Gradio UI) ·
-`tdplay/mac_app.py` (app window) · `tdplay/macos_bundle.py` (the .app) · `scripts/make_icon.py` (the icon).
+The Windows backend has its own stand-in, `tests/fake_ltx_torch.py`, and `tests/test_ltx_torch.py` runs TDPlay's
+chunk plan through the real `ltx_pipelines` classes on the CPU (it skips if `ltx_pipelines` isn't installed).
+`tests/test_windows_scripts.py` checks that the `.bat`/`.ps1` files are ASCII with CRLF line endings and, with
+`TDPLAY_PWSH` set to a PowerShell binary, parses the installer and tests its graphics card detection.
+
+Layout: `tdplay/engine.py` (Mac segment chaining, joins, resume) · `tdplay/engine_torch.py` and
+`tdplay/ltx_torch.py` (Windows: the whole shot as one LTX-2 run) · `tdplay/media.py` (ffmpeg I/O) ·
+`tdplay/models.py` (presets, downloads) · `tdplay/upscale.py` (Real-ESRGAN on MLX or PyTorch) · `tdplay/app.py`
+(Gradio UI) · `tdplay/desktop_app.py` (app window, Mac and Windows) · `tdplay/macos_bundle.py` (the .app) ·
+`windows/install.ps1` (Windows installer) · `scripts/make_icon.py` (the icon).

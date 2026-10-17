@@ -13,7 +13,7 @@ def test_window_opens_on_the_running_server(tmp_path):
     record = tmp_path / "record.json"
     env = dict(os.environ, TDPLAY_HOME=str(tmp_path / "home"), STUB_WEBVIEW_RECORD=str(record),
                PYTHONPATH=os.pathsep.join([str(ROOT / "tests" / "stubs"), str(ROOT)]))
-    result = subprocess.run([sys.executable, "-m", "tdplay.mac_app"], env=env, cwd=ROOT, capture_output=True,
+    result = subprocess.run([sys.executable, "-m", "tdplay.desktop_app"], env=env, cwd=ROOT, capture_output=True,
                             text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     data = json.loads(record.read_text())

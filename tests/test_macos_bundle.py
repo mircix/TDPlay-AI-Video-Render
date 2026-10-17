@@ -51,7 +51,7 @@ def test_launcher_is_bash32_safe_and_starts_the_app(tmp_path):
         subprocess.run([bash, "-n", str(launcher)], check=True)
         subprocess.run([bash, str(launcher)], check=True, env={"HOME": str(home), "PATH": os.environ["PATH"]})
         cwd, *args = (home / "launched.txt").read_text().splitlines()
-        assert Path(cwd) == root and args == ["-m", "tdplay.mac_app"]
+        assert Path(cwd) == root and args == ["-m", "tdplay.desktop_app"]
         assert "---" in (home / "TDPlay" / "logs" / "app.log").read_text()
 
 

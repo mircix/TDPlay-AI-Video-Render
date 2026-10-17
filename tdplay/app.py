@@ -20,6 +20,7 @@ from pathlib import Path
 import gradio as gr
 
 from tdplay import __version__, engine, models
+from tdplay.engine_torch import TorchRunner
 
 MAX_SEGMENTS = 20
 PROJECTS_DIR = models.HOME / "projects"
@@ -46,8 +47,13 @@ Start every prompt after the first by continuing the action: *same pace, same ca
 """
 
 RAM_GB = models.system_ram_gb()
-REC = models.recommend(RAM_GB)
+BACKEND = models.BACKEND
+ON_MAC = BACKEND == "mlx"
+PRESETS = models.presets_for(BACKEND)
+REC = models.recommend(RAM_GB, BACKEND)
 IS_APPLE_SILICON = sys.platform == "darwin" and platform.machine() == "arm64"
+ENGINE_LABEL = "LTX-2 via MLX" if ON_MAC else "LTX-2 via PyTorch (AMD ROCm / NVIDIA CUDA)"
+COMPUTER = "Mac" if sys.platform == "darwin" else "PC"
 
 _state: dict = {"runner": None, "last_project": None}
 
@@ -106,13 +112,15 @@ def resolution(quality: str, aspect: str) -> tuple[int, int]:
     return long, short
 
 
-def model_paths(preset_key: str) -> tuple[str, str | None]:
-    """Model and Gemma folders; ``TDPLAY_MODEL_DIR`` / ``TDPLAY_GEMMA_DIR`` override them."""
+def model_paths(preset_key: str) -> tuple[str, str | None, str | None]:
+    """Model folder, Gemma folder and (PyTorch) upscaler file; ``TDPLAY_MODEL_DIR`` etc. override them."""
     if os.environ.get("TDPLAY_MODEL_DIR"):
-        return os.environ["TDPLAY_MODEL_DIR"], os.environ.get("TDPLAY_GEMMA_DIR") or None
+        return (os.environ["TDPLAY_MODEL_DIR"], os.environ.get("TDPLAY_GEMMA_DIR") or None,
+                os.environ.get("TDPLAY_UPSAMPLER") or None)
     preset = models.PRESETS[preset_key]
     gemma = str(models.local_dir(preset.gemma_repo)) if preset.gemma_repo else None
-    return str(models.local_dir(preset.repo)), gemma
+    upsampler = str(models.local_dir(preset.upsampler[0]) / preset.upsampler[1]) if preset.upsampler else None
+    return str(models.local_dir(preset.repo)), gemma, upsampler
 
 
 def model_ready(preset_key: str) -> bool:
@@ -177,7 +185,7 @@ def _stream(project: engine.Project, job=lambda runner: runner.run(), resume_hin
             yield (status_html("Already working — wait for it to finish or press Stop.", tone="warn"),
                    gr.skip(), gr.skip())
             return
-        runner = engine.Runner(project)
+        runner = TorchRunner(project) if project.settings.backend == "torch" else engine.Runner(project)
         _state["runner"], _state["last_project"] = runner, str(project.dir)
 
     log: deque[str] = deque(maxlen=400)
@@ -224,7 +232,7 @@ def generate(image, start_video, n, *rest):
     (preset_key, quality, aspect, low_ram, fast_math, watchdog, anchor, seam, color_lock, seed, out_size,
      up_quality) = rest[2 * MAX_SEGMENTS :]
     n = int(n)
-    if not IS_APPLE_SILICON and not os.environ.get("TDPLAY_LTX_CMD"):
+    if ON_MAC and not IS_APPLE_SILICON and not os.environ.get("TDPLAY_LTX_CMD"):
         yield (status_html("TDPlay AI Video Render needs a Mac with Apple Silicon (M1 or newer) to generate.",
                            tone="error"), None, gr.skip())
         return
@@ -233,9 +241,10 @@ def generate(image, start_video, n, *rest):
                None, gr.skip())
         return
     width, height = resolution(quality, aspect)
-    model_dir, gemma_dir = model_paths(preset_key)
+    model_dir, gemma_dir, upsampler = model_paths(preset_key)
     settings = engine.Settings(
         width=width, height=height, model_dir=model_dir, gemma_dir=gemma_dir, low_ram=bool(low_ram),
+        backend=BACKEND, upsampler=upsampler, offload="disk" if low_ram else "cpu",
         fast_math=bool(fast_math), seed=int(seed if seed is not None else -1), anchor_strength=float(anchor),
         seam_frames=int(seam), color_lock=bool(color_lock), gpu_watchdog_fix=bool(watchdog),
         upscale=out_size or "off", upscale_quality=up_quality or "fast",
@@ -263,6 +272,7 @@ def resume(project_dir, low_ram, fast_math, watchdog):
     # Memory/GPU settings may change between attempts; everything that shapes the shot stays as it was.
     s = project.settings
     s.low_ram, s.fast_math, s.gpu_watchdog_fix = bool(low_ram), bool(fast_math), bool(watchdog)
+    s.offload = "disk" if low_ram else "cpu"
     yield from _stream(project)
 
 
@@ -338,16 +348,16 @@ def preset_status(preset_key):
 
 def models_table() -> str:
     rows = ["| Model | Download | Status |", "|---|---|---|"]
-    for key, p in models.PRESETS.items():
+    for key, p in PRESETS.items():
         ready = "✅ ready" if models.preset_ready(p) else "not downloaded"
-        mark = " ← recommended for this Mac" if key == REC.preset else ""
+        mark = f" ← recommended for this {COMPUTER}" if key == REC.preset else ""
         rows.append(f"| {p.label}{mark} | {_SIZES.get(key, '?')} | {ready} |")
     free = shutil.disk_usage(models.HOME if models.HOME.exists() else Path.home()).free / 1e9
     rows.append(f"\nFree disk space: **{free:.0f} GB** · models are stored in `{models.MODELS_DIR}`")
     return "\n".join(rows)
 
 
-_SIZES = {"ltx-2.5-q8": "≈ 45 GB", "ltx-2.3-q8": "≈ 38 GB", "ltx-2.3-q4": "≈ 29 GB"}
+_SIZES = {"ltx-2.5-q8": "≈ 45 GB", "ltx-2.3-q8": "≈ 38 GB", "ltx-2.3-q4": "≈ 29 GB", "ltx-2.3-fp8": "≈ 55 GB"}
 
 
 def download_models(preset_key):
@@ -371,12 +381,12 @@ def _download_models(preset_key):
         yield (status_html("Not enough free disk space.", tone="error",
                            detail=f"Needs about {needed:.0f} GB plus room for videos; {free:.0f} GB free."), gr.skip())
         return
-    for repo in models.repos_for(preset):
+    for repo, patterns in models.downloads_for(preset):
         if models.is_downloaded(repo):
             continue
         started = time.time()
         try:
-            for progress in models.download(repo):
+            for progress in models.download(repo, patterns):
                 msg = models.wait_message(progress, started)
                 yield status_html(f"Downloading {preset.label}", progress.fraction, msg), gr.skip()
         except Exception as exc:  # network errors, disk full, ...
@@ -412,7 +422,7 @@ def build() -> gr.Blocks:
             gr.Markdown(
                 f"# 🎬 TDPlay AI Video Render\nOne continuous AI video shot, built segment by segment with "
                 f"picture-and-sound continuity — free and private, on your computer.  \n<small>{chip} · {RAM_GB} GB · "
-                f"LTX-2 via MLX · v{__version__}</small>",
+                f"{ENGINE_LABEL} · v{__version__}</small>",
                 scale=5,
             )
             appearance = gr.Radio(THEMES, value=theme_pref(), label="Appearance", scale=1, min_width=260)
@@ -422,7 +432,7 @@ def build() -> gr.Blocks:
                     with gr.Column(scale=5):
                         image = gr.Image(label="Character / first frame (optional)", type="filepath",
                                          sources=["upload", "clipboard"], height=240)
-                        with gr.Accordion("…or continue a video you already have", open=False):
+                        with gr.Accordion("…or continue a video you already have", open=False, visible=ON_MAC):
                             start_video = gr.Video(label="Start video (any size; it is cropped to the shot size)",
                                                    sources=["upload"], height=200)
                         gr.Markdown(TIPS)
@@ -441,24 +451,28 @@ def build() -> gr.Blocks:
                         total = gr.Markdown(total_text(None, 3, *[4] * 3))
                         example_btn = gr.Button("Load an example", size="sm")
                         with gr.Accordion("Settings", open=False):
-                            preset = gr.Dropdown([(p.label, k) for k, p in models.PRESETS.items()], value=REC.preset,
+                            preset = gr.Dropdown([(p.label, k) for k, p in PRESETS.items()], value=REC.preset,
                                                  label="Model")
                             with gr.Row():
                                 quality = gr.Radio(list(QUALITIES), value=REC.quality, label="Resolution")
                                 aspect = gr.Radio(ASPECTS, value=ASPECTS[0], label="Shape")
-                            low_ram = gr.Checkbox(REC.low_ram, label="Low-RAM mode",
-                                                  info="Streams the model from disk: ~5% slower, needs far less memory.")
-                            fast_math = gr.Checkbox(True, label="Faster math (float16)",
+                            low_ram = gr.Checkbox(
+                                REC.low_ram, label="Low-RAM mode",
+                                info=("Streams the model from disk: ~5% slower, needs far less memory." if ON_MAC else
+                                      "Streams the model from disk (~5 GB RAM). Off keeps it in RAM: faster, but "
+                                      "needs about 36 GB free."))
+                            fast_math = gr.Checkbox(True, label="Faster math (float16)", visible=ON_MAC,
                                                     info="About 20% faster. Turn off if you see glitches.")
-                            watchdog = gr.Checkbox(False, label="GPU watchdog workaround (macOS 26)",
+                            watchdog = gr.Checkbox(False, label="GPU watchdog workaround (macOS 26)", visible=ON_MAC,
                                                    info="Turn on if a render dies with a GPU timeout / watchdog "
                                                         "error. The Mac may feel less responsive while rendering.")
                             anchor = gr.Slider(0, 1, value=0, step=0.05,
                                                label="Keep the character's face: re-anchor the photo every segment",
                                                info="0 = off. 0.5–0.7 stops face drift, but pulls each segment's "
                                                     "last frame toward the photo's pose and framing.")
-                            seam = gr.Slider(0, 16, value=8, step=1, label="Seam blend (frames)")
-                            color_lock = gr.Checkbox(True, label="Color lock at seams",
+                            # The PyTorch backend blends the joins inside LTX-2, so these are Mac-only.
+                            seam = gr.Slider(0, 16, value=8, step=1, label="Seam blend (frames)", visible=ON_MAC)
+                            color_lock = gr.Checkbox(True, label="Color lock at seams", visible=ON_MAC,
                                                      info="Cancels the small color shift each continuation adds.")
                             seed = gr.Number(-1, precision=0, label="Seed (-1 = random)")
                         with gr.Row():
@@ -475,7 +489,7 @@ def build() -> gr.Blocks:
                         status = gr.HTML(status_html(
                             "Ready." if ready else "First, download the model in the Models tab.",
                             tone="info" if ready else "warn",
-                            detail="" if IS_APPLE_SILICON else "Generation needs a Mac with Apple Silicon."))
+                            detail="" if IS_APPLE_SILICON or not ON_MAC else "Generation needs a Mac with Apple Silicon."))
                         video = gr.Video(label="Your shot (updates after every segment)", interactive=False,
                                          height=420, loop=False)
                         with gr.Row():
@@ -504,16 +518,20 @@ def build() -> gr.Blocks:
                     "TDPlay AI Video Render runs **LTX-2** (Lightricks, open weights) through "
                     "[ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx), natively on Apple Silicon. Download once; "
                     "after that everything runs offline. Only the files the fast *distilled* pipeline needs are "
-                    "downloaded (about half of each pack)."
+                    "downloaded (about half of each pack)." if ON_MAC else
+                    "TDPlay AI Video Render runs **LTX-2.3** (Lightricks, open weights) with Lightricks' own "
+                    "[LTX-2 code](https://github.com/Lightricks/LTX-2) on PyTorch: AMD Radeon through ROCm, or NVIDIA "
+                    "through CUDA. Download once; after that everything runs offline. The download is the 8-bit "
+                    "distilled model, its 2× upscaler and the Gemma 3 text encoder."
                 )
                 table = gr.Markdown(models_table())
                 with gr.Row():
-                    dl_preset = gr.Dropdown([(p.label, k) for k, p in models.PRESETS.items()], value=REC.preset,
+                    dl_preset = gr.Dropdown([(p.label, k) for k, p in PRESETS.items()], value=REC.preset,
                                             label="Model to download", scale=4)
                     dl_btn = gr.Button("Download", variant="primary", scale=1)
                 dl_status = gr.HTML()
                 gr.Markdown(
-                    f"This Mac: **{chip}, {RAM_GB} GB**. Recommended: **{models.PRESETS[REC.preset].label}**, "
+                    f"This {COMPUTER}: **{chip}, {RAM_GB} GB**. Recommended: **{models.PRESETS[REC.preset].label}**, "
                     f"{REC.quality}, segments up to {REC.max_segment_seconds} s"
                     f"{', Low-RAM mode on' if REC.low_ram else ''}.  \nThe weights are under the "
                     "[LTX-2 Community License](https://huggingface.co/Lightricks/LTX-2.3/blob/main/LICENSE): free to use, "
@@ -576,37 +594,53 @@ def build() -> gr.Blocks:
     return demo
 
 
+if ON_MAC:
+    HOW_STEPS = """2. **Every next segment** is generated by LTX-2's *extend* mode: the last 25 frames of the shot so far
+   (about one second of picture **and sound**) are pinned at the start of the new clip, so motion, camera and audio
+   carry straight on.
+3. The joins are cross-faded (picture and sound) and color-locked, then everything is assembled into one mp4."""
+    RESUME_NOTE = "finished segments are kept."
+    PLATFORM_NOTE = """
+On macOS 26 a GPU watchdog bug can abort long renders. If a segment fails with a GPU timeout or watchdog error, turn
+on **GPU watchdog workaround** in Settings, keep the display awake, and press Resume.
+"""
+else:
+    HOW_STEPS = """2. **Every next segment** is one more chunk of LTX-2's own long-video mode: the last 25 frames of
+   the segment before (about one second of picture **and sound**) are pinned at its start, so motion, camera and
+   audio carry straight on. The whole shot is made in one model run, and LTX-2 cross-fades the joins itself.
+3. The decoded pieces are assembled into one mp4."""
+    RESUME_NOTE = ("the shot is rendered again from the start, with the same seed (on Windows the segments are made "
+                   "in one run, so they can't be kept separately yet).")
+    PLATFORM_NOTE = """
+With Low-RAM mode on, the model's weights stream from the SSD instead of being held in memory: this is what lets
+32 GB of RAM work. If the GPU isn't found, update the AMD Adrenalin driver and restart Windows.
+"""
+
 HELP = f"""
 ### How it works
 TDPlay AI Video Render rebuilds RunningHub's *MINIMAX H3 Motion Context* workflow with open weights:
 
 1. **Segment 1** is generated from its prompt — and from your character photo, if you add one.
-2. **Every next segment** is generated by LTX-2's *extend* mode: the last 25 frames of the shot so far
-   (about one second of picture **and sound**) are pinned at the start of the new clip, so motion, camera and audio
-   carry straight on.
-3. The joins are cross-faded (picture and sound) and color-locked, then everything is assembled into one mp4.
+{HOW_STEPS}
 
-Optionally, the finished shot is then **upscaled to 1080p or 4K** with Real-ESRGAN on the Mac's GPU (choose
+Optionally, the finished shot is then **upscaled to 1080p or 4K** with Real-ESRGAN on the {COMPUTER}'s GPU (choose
 *Final output size* next to Generate, or upscale any finished project from the Projects tab). *Fast* takes minutes;
 *Best detail* gives sharper texture but takes several times longer. The original-size video is always kept.
 
-After each segment you can watch the shot so far. If anything stops it (you, an error, the Mac running out of memory),
-press **Resume**: finished segments are kept.
+After each segment you can watch the shot so far. If anything stops it (you, an error, the {COMPUTER} running out of
+memory), press **Resume**: {RESUME_NOTE}
 
 ### Speed and memory
-Everything runs on your Mac's GPU. A segment typically takes a few minutes; long, high-resolution segments take longer.
-If a segment fails with "ran out of memory": turn on Low-RAM mode, lower the resolution, use shorter segments, close
-other apps, then press Resume.
-
-On macOS 26 a GPU watchdog bug can abort long renders. If a segment fails with a GPU timeout or watchdog error, turn
-on **GPU watchdog workaround** in Settings, keep the display awake, and press Resume.
-
+Everything runs on your {COMPUTER}'s GPU. A segment typically takes a few minutes; long, high-resolution segments take
+longer. If a segment fails with "ran out of memory": turn on Low-RAM mode, lower the resolution, use shorter
+segments, close other apps, then press Resume.
+{PLATFORM_NOTE}
 ### Where things are
 - Projects (videos, each segment, a log): `{PROJECTS_DIR}`
 - Models: `{models.MODELS_DIR}`
 
 ### Differences from MiniMax H3
-H3 segments can be 15 s each; on a Mac, LTX-2 segments of 3–6 s work best (use more of them). H3's "shared
+H3 segments can be 15 s each; on a {COMPUTER}, LTX-2 segments of 3–6 s work best (use more of them). H3's "shared
 reference" keeps a face from the photo; here the closest match is the *re-anchor* setting, which works best when the
 character stays in roughly the same framing.
 """
