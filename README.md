@@ -24,15 +24,19 @@ one-time model download everything runs offline on your Mac.
 
 ## Install (once)
 
-1. Unzip `TDPlay-AI-Video-Render.zip` and move the `TDPlay-AI-Video-Render` folder somewhere permanent (for example your home folder).
+1. Get the `TDPlay-AI-Video-Render` folder (clone it from GitHub, or unzip `TDPlay-AI-Video-Render.zip`) and keep it
+   somewhere permanent, for example your home folder or your Claude Workspace folder.
 2. Double-click **`install.command`**.
    * If macOS says it "cannot be opened because it is from an unidentified developer": right-click the file →
      **Open** → **Open**. Or open Terminal and run `bash ~/TDPlay-AI-Video-Render/install.command` (adjust the path).
-   * The installer sets up [Homebrew](https://brew.sh) (it asks first), ffmpeg, Python and the model code. At the
-     end it offers to download the recommended model for your Mac (30–45 GB). You can also do that later in
-     the app's **Models** tab.
-3. Double-click **`start.command`**. TDPlay AI Video Render opens in your browser at `http://127.0.0.1:7860`.
-   Keep the Terminal window open while you use it; close it to quit.
+   * The installer sets up [Homebrew](https://brew.sh) (it asks first), ffmpeg, Python and the model code, and adds
+     **TDPlay AI Video Render** to your Applications folder. At the end it offers to download the recommended model
+     for your Mac (30–45 GB). You can also do that later in the app's **Models** tab.
+3. Open **TDPlay AI Video Render** from Applications, Launchpad or Spotlight. It opens in its own window; drag its
+   icon to the Dock to keep it there. Quit it like any app (⌘Q). If a video is still being made, it asks first.
+   * `start.command` still works too: it opens the same app in your web browser, with a Terminal window showing the
+     log.
+   * If you move the `TDPlay-AI-Video-Render` folder, run `install.command` again so the app finds it.
 
 ## Make a long take
 
@@ -41,6 +45,21 @@ one-time model download everything runs offline on your Mac.
 2. Pick the number of **segments** and write **one prompt per segment**, each with a length in seconds.
 3. Press **Generate**. The shot so far appears after every segment, so you can watch it grow.
 4. The finished `render.mp4` is in the project folder (**Open project folder**).
+
+### 1080p and 4K
+
+Choose **Final output size** next to Generate: *1080p* or *4K*. After the last segment the finished shot is upscaled
+with **Real-ESRGAN** on the Mac's GPU, and saved as `render_1080p.mp4` or `render_4k.mp4` next to the original
+`render.mp4` (which is kept). You can also upscale any finished project later: **Projects** tab → choose it →
+*Upscale this project*.
+
+* **Fast** (realesr-general-x4v3) is made for real-world video and takes minutes for a short shot.
+* **Best detail** (RealESRGAN_x4plus) gives sharper texture but takes several times longer. Use it for short shots
+  or let it run overnight.
+
+The shot is rendered at the size your Mac can handle (512p–704p) and enlarged 4×. Upscaling sharpens and cleans
+what is there; it cannot invent detail the way rendering natively at 4K would. 4K files use HEVC (H.265), which
+every current Mac, iPhone and browser plays.
 
 If a run stops for any reason (you pressed Stop, the Mac ran out of memory, you quit), press **Resume**.
 Finished segments are kept. Older projects are in the **Projects** tab.
@@ -71,7 +90,7 @@ The app picks these automatically from your memory size. You can change them und
 **Speed.** Expect several minutes per segment at 512p, and more at 704p and on longer segments. It varies a lot
 by chip, so treat your first run as the benchmark. For reference, the ltx-2-mlx authors measured on an M1 Max
 with LTX-2.5 8-bit: about 100 s to add ⅔ s at 768×512, and about 10 min to add 4 s at 1280×704. M4 and M5
-chips should be faster. `start.command` keeps the Mac from idle-sleeping while the app is open.
+chips should be faster. The app keeps the Mac from idle-sleeping while it is open.
 
 ### Settings explained
 
@@ -129,19 +148,23 @@ H3 is a larger cloud model. Expect LTX-2 on a laptop to be good but not identica
 * **Faces change over a long shot** → raise *Keep the character's face* to 0.5–0.7, and avoid prompts where the
   character turns away at a join.
 * **Nothing happens on double-click** → see the right-click → Open tip under Install.
-* **The full log** is `log.txt` in each project folder.
+* **The full log** is `log.txt` in each project folder. The app's own log is `~/TDPlay/logs/app.log`.
+* **The app doesn't open, or says its folder was moved** → run `install.command` again from the folder's current
+  location.
 
 ## Where things are
 
-* Projects: `~/TDPlay/projects/<date>_<title>/render.mp4`
+* The app: `/Applications/TDPlay AI Video Render.app` (or `~/Applications` if `/Applications` isn't writable). It
+  is a small launcher for this folder.
+* Projects: `~/TDPlay/projects/<date>_<title>/render.mp4` (plus `render_1080p.mp4` / `render_4k.mp4` if upscaled)
 * Models: `~/TDPlay/models/` (delete a folder there to free its space)
 * App code: this folder (`.venv/` and `vendor/` are created by the installer)
 
 ## Update or uninstall
 
-* **Update**: replace this folder with a new version, then run `install.command` again. Models and projects stay in
-  `~/TDPlay`.
-* **Uninstall**: delete this folder and `~/TDPlay`. ffmpeg and uv can be removed with
+* **Update**: `git pull` in this folder (or replace it with a new version), then run `install.command` again.
+  Models and projects stay in `~/TDPlay`.
+* **Uninstall**: delete the app from Applications, this folder, and `~/TDPlay`. ffmpeg and uv can be removed with
   `brew uninstall ffmpeg uv`.
 
 ## Credits and licenses
@@ -153,15 +176,21 @@ H3 is a larger cloud model. Expect LTX-2 on a laptop to be good but not identica
 * **[ltx-2-mlx](https://github.com/dgrauet/ltx-2-mlx)** (MIT) by dgrauet: the MLX port and the pre-converted weights
   (`dgrauet/ltx-2.x-mlx-*` on Hugging Face). TDPlay AI Video Render pins release `v0.16.3`.
 * **Gemma 3** (`mlx-community/gemma-3-12b-it-4bit`) is the text encoder for the LTX-2.3 packs, under the Gemma terms.
-* **[Gradio](https://gradio.app)** (Apache-2.0) for the interface, **[ffmpeg](https://ffmpeg.org)** for video.
+* **[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)** (BSD-3-Clause) by Xintao Wang et al. for upscaling,
+  using the MLX conversions `mlx-community/Real-ESRGAN-general-x4v3` and `mlx-community/Real-ESRGAN-x4plus`.
+* **[Gradio](https://gradio.app)** (Apache-2.0) for the interface, **[pywebview](https://pywebview.flowrl.com)**
+  (BSD-3-Clause) for the app window, **[ffmpeg](https://ffmpeg.org)** for video.
 * "RunningHub", "MiniMax" and "H3" are named only to describe the workflow TDPlay AI Video Render recreates. This project is not
   affiliated with them.
 
 ## For developers
 
 ```bash
-.venv/bin/python -m tdplay                 # start the UI (TDPLAY_PORT, TDPLAY_NO_BROWSER, TDPLAY_HOME)
+.venv/bin/python -m tdplay                 # start the UI in the browser (TDPLAY_PORT, TDPLAY_NO_BROWSER, TDPLAY_HOME)
+.venv/bin/python -m tdplay.mac_app         # the same UI in its own window (what the .app runs)
 .venv/bin/python -m tdplay download        # download the recommended model (or: download ltx-2.3-q4)
+.venv/bin/python -m tdplay.upscale IN.mp4 OUT.mp4 --width 3840 --height 2160 --quality fast
+.venv/bin/python -m tdplay.macos_bundle    # (re)build the app in /Applications
 uv pip install --python .venv/bin/python pytest
 .venv/bin/python -m pytest tests             # runs the whole pipeline against a fake ltx-2-mlx (no GPU needed)
 ```
@@ -169,7 +198,10 @@ uv pip install --python .venv/bin/python pytest
 `tests/fake_ltx.py` stands in for the `ltx-2-mlx` CLI. It writes frame numbers into the pixels and a continuous
 tone into the audio, so the tests can prove there are no dropped or duplicated frames and no audio gaps at the
 joins. The tests also check every command TDPlay AI Video Render builds against the real `ltx-2-mlx` argument parser, and cover
-resuming after an out-of-memory kill, stop/resume and continuing an existing video.
+resuming after an out-of-memory kill, stop/resume and continuing an existing video. The upscaler is checked against
+the original PyTorch Real-ESRGAN (`tests/test_upscale.py`), and the app launcher is run under bash 3.2, the version
+macOS uses (`tests/test_macos_bundle.py`; set `TDPLAY_BASH32` to a bash 3.2 binary to include it).
 
 Layout: `tdplay/engine.py` (segment chaining, joins, resume) · `tdplay/media.py` (ffmpeg I/O) ·
-`tdplay/models.py` (presets, downloads) · `tdplay/app.py` (Gradio UI).
+`tdplay/models.py` (presets, downloads) · `tdplay/upscale.py` (Real-ESRGAN on MLX) · `tdplay/app.py` (Gradio UI) ·
+`tdplay/mac_app.py` (app window) · `tdplay/macos_bundle.py` (the .app) · `scripts/make_icon.py` (the icon).

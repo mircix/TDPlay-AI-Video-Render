@@ -6,6 +6,7 @@ Start it with ``./start.command`` (or ``python -m tdplay``); it opens in your br
 from __future__ import annotations
 
 import html
+import json
 import os
 import platform
 import shutil
@@ -26,6 +27,8 @@ PROJECTS_DIR = models.HOME / "projects"
 # Short side -> long side; every size is a multiple of 64, as the two-stage pipeline needs.
 QUALITIES = {"512p": (512, 896), "576p": (576, 1024), "704p": (704, 1280)}
 ASPECTS = ["16:9 landscape", "9:16 portrait", "1:1 square"]
+OUTPUT_SIZES = [("Original", "off"), ("1080p", "1080p"), ("4K", "4k")]
+UPSCALERS = [("Fast", "fast"), ("Best detail (slower)", "best")]
 
 EXAMPLE = [
     ("A young woman in a yellow raincoat walks toward the camera down a rainy neon-lit street at night. "
@@ -47,6 +50,45 @@ REC = models.recommend(RAM_GB)
 IS_APPLE_SILICON = sys.platform == "darwin" and platform.machine() == "arm64"
 
 _state: dict = {"runner": None, "last_project": None}
+
+THEMES = [("Match system", "system"), ("Light", "light"), ("Dark", "dark")]
+# Gradio's dark theme is the "dark" class on <body>. "system" follows the OS, also when it changes later.
+APPLY_THEME_JS = """
+(mode) => {
+  const media = window.matchMedia('(prefers-color-scheme: dark)');
+  const apply = (m) => document.body.classList.toggle('dark', m === 'dark' || (m === 'system' && media.matches));
+  window.__tdplayTheme = mode;
+  apply(mode);
+  if (!window.__tdplayThemeWatch) {
+    window.__tdplayThemeWatch = true;
+    media.addEventListener('change', () => apply(window.__tdplayTheme));
+  }
+  return mode;
+}
+"""
+
+
+def _prefs_path() -> Path:
+    return models.HOME / "settings.json"
+
+
+def load_prefs() -> dict:
+    try:
+        return json.loads(_prefs_path().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_pref(key: str, value) -> None:
+    prefs = load_prefs()
+    prefs[key] = value
+    _prefs_path().parent.mkdir(parents=True, exist_ok=True)
+    _prefs_path().write_text(json.dumps(prefs, indent=2))
+
+
+def theme_pref() -> str:
+    mode = load_prefs().get("theme", "system")
+    return mode if mode in {v for _, v in THEMES} else "system"
 _lock = threading.Lock()
 
 
@@ -128,11 +170,11 @@ def open_folder(path: str | None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _stream(project: engine.Project):
-    """Run ``project`` and turn engine events into (status, video, log) UI updates."""
+def _stream(project: engine.Project, job=lambda runner: runner.run(), resume_hint: bool = True):
+    """Run a job on ``project`` (by default: generate it) and turn its events into (status, video, log) updates."""
     with _lock:
         if _state["runner"] is not None:
-            yield (status_html("Already generating — wait for it to finish or press Stop.", tone="warn"),
+            yield (status_html("Already working — wait for it to finish or press Stop.", tone="warn"),
                    gr.skip(), gr.skip())
             return
         runner = engine.Runner(project)
@@ -144,7 +186,7 @@ def _stream(project: engine.Project):
     title, fraction, detail = "Starting…", 0.0, ""
     log.append(f"Project folder: {project.dir}")
     try:
-        for event in runner.run():
+        for event in job(runner):
             video = gr.skip()
             if event.kind == "log":
                 log.append(event.text)
@@ -157,15 +199,15 @@ def _stream(project: engine.Project):
                 video = event.path
             elif event.kind == "done":
                 log.append(event.text)
-                yield (status_html("Done! " + event.text, 1.0, f"Saved to {project.output}", tone="ok"),
+                yield (status_html("Done! " + event.text, 1.0, f"Saved to {event.path}", tone="ok"),
                        event.path, log_html(log))
                 return
             elif event.kind in ("error", "stopped"):
                 log.append(event.text)
                 tone = "warn" if event.kind == "stopped" else "error"
                 head = "Stopped." if event.kind == "stopped" else "Something went wrong."
-                yield (status_html(head, fraction, event.text.split("\n\n")[0] + "  Press Resume to continue.", tone),
-                       gr.skip(), log_html(log))
+                detail = event.text.split("\n\n")[0] + ("  Press Resume to continue." if resume_hint else "")
+                yield status_html(head, fraction, detail, tone), gr.skip(), log_html(log)
                 return
             # tqdm lines arrive many times a second; refresh the page at most twice a second.
             now = time.time()
@@ -179,7 +221,8 @@ def _stream(project: engine.Project):
 
 def generate(image, start_video, n, *rest):
     prompts, seconds = rest[:MAX_SEGMENTS], rest[MAX_SEGMENTS : 2 * MAX_SEGMENTS]
-    preset_key, quality, aspect, low_ram, fast_math, watchdog, anchor, seam, color_lock, seed = rest[2 * MAX_SEGMENTS :]
+    (preset_key, quality, aspect, low_ram, fast_math, watchdog, anchor, seam, color_lock, seed, out_size,
+     up_quality) = rest[2 * MAX_SEGMENTS :]
     n = int(n)
     if not IS_APPLE_SILICON and not os.environ.get("TDPLAY_LTX_CMD"):
         yield (status_html("TDPlay AI Video Render needs a Mac with Apple Silicon (M1 or newer) to generate.",
@@ -195,6 +238,7 @@ def generate(image, start_video, n, *rest):
         width=width, height=height, model_dir=model_dir, gemma_dir=gemma_dir, low_ram=bool(low_ram),
         fast_math=bool(fast_math), seed=int(seed if seed is not None else -1), anchor_strength=float(anchor),
         seam_frames=int(seam), color_lock=bool(color_lock), gpu_watchdog_fix=bool(watchdog),
+        upscale=out_size or "off", upscale_quality=up_quality or "fast",
     )
     segments = [engine.Segment(str(p or ""), int(s)) for p, s in zip(prompts[:n], seconds[:n])]
     try:
@@ -220,6 +264,26 @@ def resume(project_dir, low_ram, fast_math, watchdog):
     s = project.settings
     s.low_ram, s.fast_math, s.gpu_watchdog_fix = bool(low_ram), bool(fast_math), bool(watchdog)
     yield from _stream(project)
+
+
+def upscale_project(project_dir, size, quality):
+    if not project_dir:
+        yield status_html("Choose a project in the Projects tab first.", tone="warn"), gr.skip(), gr.skip()
+        return
+    project = engine.Project.load(project_dir)
+    yield from _stream(project, lambda runner: runner.upscale(size, quality), resume_hint=False)
+
+
+def is_busy() -> bool:
+    """True while a render, an upscale or a model download is running (the Mac app asks before quitting)."""
+    return _state["runner"] is not None or bool(_state.get("downloading"))
+
+
+def shutdown() -> None:
+    """Stop a running job; called when the app quits."""
+    runner = _state["runner"]
+    if runner is not None:
+        runner.cancel()
 
 
 def resume_last(low_ram, fast_math, watchdog):
@@ -259,6 +323,9 @@ def show_project(project_dir):
     head = (f"**{p.title}**\n\nStatus: {p.status} · {p.done} of {len(p.segments)} segments · "
             f"{p.settings.width}×{p.settings.height} · seed {p.settings.seed}\n")
     lines = [head] + [f"{i + 1}. ({s.seconds} s) {s.prompt}" for i, s in enumerate(p.segments)]
+    files = [f.name for f in (p.output, p.upscaled("1080p"), p.upscaled("4k")) if f.exists()]
+    if files:
+        lines.append("\nFiles: " + ", ".join(f"`{f}`" for f in files))
     video = p.output if p.output.exists() else (p.preview if p.preview.exists() else None)
     return (str(video) if video else None), "\n".join(lines)
 
@@ -284,6 +351,14 @@ _SIZES = {"ltx-2.5-q8": "≈ 45 GB", "ltx-2.3-q8": "≈ 38 GB", "ltx-2.3-q4": "�
 
 
 def download_models(preset_key):
+    _state["downloading"] = True
+    try:
+        yield from _download_models(preset_key)
+    finally:
+        _state["downloading"] = False
+
+
+def _download_models(preset_key):
     preset = models.PRESETS[preset_key]
     try:
         needed = models.download_size_gb(preset, missing_only=True)
@@ -333,11 +408,14 @@ CSS = """
 def build() -> gr.Blocks:
     chip = models.chip_name()
     with gr.Blocks(title="TDPlay AI Video Render", delete_cache=(1800, 3600)) as demo:
-        gr.Markdown(
-            f"# 🎬 TDPlay AI Video Render\nOne continuous AI video shot, built segment by segment with picture-and-sound "
-            f"continuity — free and private, on your Mac.  \n<small>{chip} · {RAM_GB} GB · LTX-2 via MLX · "
-            f"v{__version__}</small>"
-        )
+        with gr.Row(equal_height=True):
+            gr.Markdown(
+                f"# 🎬 TDPlay AI Video Render\nOne continuous AI video shot, built segment by segment with "
+                f"picture-and-sound continuity — free and private, on your computer.  \n<small>{chip} · {RAM_GB} GB · "
+                f"LTX-2 via MLX · v{__version__}</small>",
+                scale=5,
+            )
+            appearance = gr.Radio(THEMES, value=theme_pref(), label="Appearance", scale=1, min_width=260)
         with gr.Tabs() as tabs:
             with gr.Tab("Create", id="create"):
                 with gr.Row(equal_height=False):
@@ -384,6 +462,11 @@ def build() -> gr.Blocks:
                                                      info="Cancels the small color shift each continuation adds.")
                             seed = gr.Number(-1, precision=0, label="Seed (-1 = random)")
                         with gr.Row():
+                            out_size = gr.Radio(OUTPUT_SIZES, value="off", label="Final output size",
+                                                info="1080p and 4K are made by AI upscaling (Real-ESRGAN) after "
+                                                     "the last segment. The original-size video is kept too.")
+                            up_quality = gr.Radio(UPSCALERS, value="fast", label="Upscaler")
+                        with gr.Row():
                             go = gr.Button("Generate", variant="primary", scale=3)
                             stop_btn = gr.Button("Stop", variant="stop", scale=1)
                             resume_btn = gr.Button("Resume", scale=1)
@@ -409,6 +492,11 @@ def build() -> gr.Blocks:
                         with gr.Row():
                             resume_project_btn = gr.Button("Resume this project", variant="primary")
                             project_folder_btn = gr.Button("Open folder")
+                        with gr.Group():
+                            with gr.Row():
+                                p_size = gr.Radio(OUTPUT_SIZES[1:], value="1080p", label="Upscale to")
+                                p_quality = gr.Radio(UPSCALERS, value="fast", label="Upscaler")
+                            upscale_btn = gr.Button("Upscale this project")
                     project_video = gr.Video(label="Video", interactive=False, height=360, scale=6)
 
             with gr.Tab("Models", id="models") as models_tab:
@@ -456,7 +544,7 @@ def build() -> gr.Blocks:
         outputs = [status, video, log]
         go.click(generate,
                  [image, start_video, n_segments, *prompts, *seconds, preset, quality, aspect, low_ram, fast_math,
-                  watchdog, anchor, seam, color_lock, seed],
+                  watchdog, anchor, seam, color_lock, seed, out_size, up_quality],
                  outputs, api_visibility="private", show_progress="hidden")
         stop_btn.click(stop, None, status, api_visibility="private", queue=False)
         resume_btn.click(resume_last, [low_ram, fast_math, watchdog], outputs, api_visibility="private",
@@ -471,12 +559,20 @@ def build() -> gr.Blocks:
             resume, [project, low_ram, fast_math, watchdog], outputs, api_visibility="private",
             show_progress="hidden")
 
+        upscale_btn.click(lambda: gr.Tabs(selected="create"), None, tabs, api_visibility="private").then(
+            upscale_project, [project, p_size, p_quality], outputs, api_visibility="private", show_progress="hidden")
+
         dl_btn.click(download_models, dl_preset, [dl_status, table], api_visibility="private",
                      show_progress="hidden")
         preset.change(preset_status, preset, status, api_visibility="private")
         projects_tab.select(refresh_projects, None, project, api_visibility="private")
         models_tab.select(models_table, None, table, api_visibility="private")
         demo.load(models_table, None, table, api_visibility="private")
+        # The saved choice is read on every page load, so all windows and browsers agree.
+        appearance.input(lambda mode: save_pref("theme", mode), appearance, None, js=APPLY_THEME_JS,
+                         api_visibility="private", queue=False)
+        demo.load(theme_pref, None, appearance, api_visibility="private", queue=False).then(
+            None, appearance, None, js=APPLY_THEME_JS)
     return demo
 
 
@@ -489,6 +585,10 @@ TDPlay AI Video Render rebuilds RunningHub's *MINIMAX H3 Motion Context* workflo
    (about one second of picture **and sound**) are pinned at the start of the new clip, so motion, camera and audio
    carry straight on.
 3. The joins are cross-faded (picture and sound) and color-locked, then everything is assembled into one mp4.
+
+Optionally, the finished shot is then **upscaled to 1080p or 4K** with Real-ESRGAN on the Mac's GPU (choose
+*Final output size* next to Generate, or upscale any finished project from the Projects tab). *Fast* takes minutes;
+*Best detail* gives sharper texture but takes several times longer. The original-size video is always kept.
 
 After each segment you can watch the shot so far. If anything stops it (you, an error, the Mac running out of memory),
 press **Resume**: finished segments are kept.
@@ -512,16 +612,24 @@ character stays in roughly the same framing.
 """
 
 
-def main() -> None:
+def launch(*, port: int | None = None, open_browser: bool = True, block: bool = True) -> gr.Blocks:
+    """Start the local web server (127.0.0.1 only). With ``block=False`` it returns once the server is up."""
     PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     demo = build()
     demo.queue(default_concurrency_limit=1)
     demo.launch(
         server_name="127.0.0.1",
-        server_port=int(os.environ["TDPLAY_PORT"]) if os.environ.get("TDPLAY_PORT") else None,
-        inbrowser=not os.environ.get("TDPLAY_NO_BROWSER"),
+        server_port=port,
+        inbrowser=open_browser,
+        prevent_thread_lock=not block,
         allowed_paths=[str(models.HOME)],
         theme=gr.themes.Soft(primary_hue="orange", neutral_hue="slate"),
         css=CSS,
         footer_links=[],
     )
+    return demo
+
+
+def main() -> None:
+    launch(port=int(os.environ["TDPLAY_PORT"]) if os.environ.get("TDPLAY_PORT") else None,
+           open_browser=not os.environ.get("TDPLAY_NO_BROWSER"))

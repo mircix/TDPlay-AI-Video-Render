@@ -80,6 +80,10 @@ class Settings:
     color_lock: bool = True
     #: Relax the macOS 26 GPU watchdog for the model process (``AGX_RELAX_CDM_CTXSTORE_TIMEOUT``).
     gpu_watchdog_fix: bool = False
+    #: Upscale the finished shot: "off", "1080p" or "4k" (see ``tdplay.upscale``).
+    upscale: str = "off"
+    #: Upscaler model: "fast" or "best".
+    upscale_quality: str = "fast"
     fps: int = FPS
 
 
@@ -153,6 +157,9 @@ class Project:
     @property
     def preview(self) -> Path:
         return self.path("preview.mp4")
+
+    def upscaled(self, size: str) -> Path:
+        return self.path(f"render_{size}.mp4")
 
 
 def _slug(text: str, limit: int = 40) -> str:
@@ -237,12 +244,22 @@ def default_ltx_command() -> list[str]:
     return shlex.split(override) if override else [sys.executable, "-m", "ltx_pipelines_mlx"]
 
 
+def default_upscale_command() -> list[str]:
+    override = os.environ.get("TDPLAY_UPSCALE_CMD")
+    return shlex.split(override) if override else [sys.executable, "-m", "tdplay.upscale"]
+
+
+_UPSCALE_PROGRESS = re.compile(r"PROGRESS (\d+)/(\d+)")
+
+
 class Runner:
     """Runs (or resumes) one project. ``run()`` yields :class:`Event` objects; ``cancel()`` stops it."""
 
-    def __init__(self, project: Project, ltx_command: list[str] | None = None):
+    def __init__(self, project: Project, ltx_command: list[str] | None = None,
+                 upscale_command: list[str] | None = None):
         self.project = project
         self.ltx_command = ltx_command or default_ltx_command()
+        self.upscale_command = upscale_command or default_upscale_command()
         self._stop = threading.Event()
         self._proc: subprocess.Popen | None = None
 
@@ -284,9 +301,12 @@ class Runner:
                             path=str(self._assemble(p.preview)))
 
             final = self._assemble(p.output)
+            seconds = media.probe(final).frames / p.settings.fps
+            if p.settings.upscale != "off":
+                yield Event("preview", f"Shot finished ({seconds:.1f} s). Upscaling…", fraction=1.0, path=str(final))
+                final = yield from self._upscale(final, p.settings.upscale, p.settings.upscale_quality)
             p.status = "complete"
             p.save()
-            seconds = media.probe(final).frames / p.settings.fps
             yield Event("done", f"Finished: {seconds:.1f} s in one continuous shot.", fraction=1.0, path=str(final))
         except _Stopped:
             p.status = "stopped"
@@ -307,6 +327,44 @@ class Runner:
             p.status = "failed"
             p.save()
             yield Event("error", f"{type(exc).__name__}: {exc}")
+
+    def upscale(self, size: str, quality: str = "fast") -> Iterator[Event]:
+        """Upscale an already finished project (Projects tab)."""
+        p = self.project
+        if not p.output.exists():
+            yield Event("error", "This project isn't finished yet. Resume it first, then upscale.")
+            return
+        try:
+            out = yield from self._upscale(p.output, size, quality)
+            yield Event("done", f"Upscaled to {size.upper()}.", fraction=1.0, path=str(out))
+        except _Stopped:
+            yield Event("stopped", "Upscaling stopped. Start it again any time.")
+        except _SegmentFailed as exc:
+            yield Event("error", str(exc))
+        except Exception as exc:
+            yield Event("error", f"{type(exc).__name__}: {exc}")
+
+    def _upscale(self, src: Path, size: str, quality: str):
+        from tdplay import upscale
+
+        s = self.project.settings
+        width, height = upscale.target_size(size, s.width, s.height)
+        dst = self.project.upscaled(size)
+        label = f"Upscaling to {size.upper()} ({width}×{height})"
+        yield Event("progress", label + "…", fraction=0.0)
+        cmd = self.upscale_command + [str(src), str(dst), "--width", str(width), "--height", str(height),
+                                      "--quality", quality]
+        env = dict(os.environ, PYTHONUNBUFFERED="1", HF_HUB_DISABLE_TELEMETRY="1")
+        started = time.time()
+        for line in self._process(cmd, env, "Upscaling"):
+            if m := _UPSCALE_PROGRESS.match(line):
+                done, total = int(m.group(1)), int(m.group(2))
+                left = (time.time() - started) / done * (total - done)
+                eta = f" · about {left / 60:.0f} min left" if left >= 90 else ""
+                yield Event("progress", f"{label} · frame {done}/{total}{eta}", fraction=done / total)
+            else:
+                yield Event("log", line)
+        return dst
 
     # -- model runs ----------------------------------------------------------------
 
@@ -339,49 +397,53 @@ class Runner:
         return args
 
     def _cli(self, args: list[str], i: int, n: int) -> Iterator[Event]:
-        if self._stop.is_set():
-            raise _Stopped
         p = self.project
         env = dict(os.environ, PYTHONUNBUFFERED="1", HF_HUB_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1")
         if p.settings.fast_math:
             env["LTX2_COMPUTE_DTYPE"] = "float16"
         if p.settings.gpu_watchdog_fix:
             env["AGX_RELAX_CDM_CTXSTORE_TIMEOUT"] = "1"
-        cmd = self.ltx_command + args
-        log_path = p.path("log.txt")
+        finished_steps, bar_total, bar_n = 0, 0, 0
+        for line in self._process(self.ltx_command + args, env, f"Segment {i + 1}"):
+            if m := _TQDM.search(line):
+                step, total = int(m.group(1)), int(m.group(2))
+                if total != bar_total or step < bar_n:
+                    finished_steps += bar_total if bar_n == bar_total else bar_n
+                    bar_total = total
+                bar_n = step
+                within = 0.05 + 0.85 * min(1.0, (finished_steps + step) / DISTILLED_STEPS)
+                yield Event("progress", f"Segment {i + 1} of {n} · denoising step "
+                            f"{min(DISTILLED_STEPS, finished_steps + step)}/{DISTILLED_STEPS}",
+                            fraction=(i + within) / n)
+            elif line.startswith("[Decoding"):
+                yield Event("progress", f"Segment {i + 1} of {n} · decoding video + sound", fraction=(i + 0.93) / n)
+            else:
+                yield Event("log", line)
+
+    def _process(self, cmd: list[str], env: dict, what: str) -> Iterator[str]:
+        """Run ``cmd`` in its own process group, logging it, and yield its output line by line.
+
+        Raises ``_Stopped`` after :meth:`cancel` and ``_SegmentFailed`` (with a hint) on a non-zero exit.
+        """
+        if self._stop.is_set():
+            raise _Stopped
         tail: list[str] = []
-        with log_path.open("a") as log:
+        with self.project.path("log.txt").open("a") as log:
             log.write(f"\n$ {shlex.join(cmd)}\n")
             self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
-                                          cwd=p.dir, start_new_session=True)
+                                          cwd=self.project.dir, start_new_session=True)
             # tqdm redraws with \r; split on both so every update becomes a line.
             fd = self._proc.stdout.fileno()
             buffer = b""
-            finished_steps, bar_total, bar_n = 0, 0, 0
             while chunk := os.read(fd, 65536):
                 buffer += chunk
                 *lines, buffer = re.split(rb"[\r\n]", buffer)
                 for raw_line in lines:
                     line = raw_line.decode(errors="replace").strip()
-                    if not line:
-                        continue
-                    log.write(line + "\n")
-                    tail = (tail + [line])[-15:]
-                    if m := _TQDM.search(line):
-                        step, total = int(m.group(1)), int(m.group(2))
-                        if total != bar_total or step < bar_n:
-                            finished_steps += bar_total if bar_n == bar_total else bar_n
-                            bar_total = total
-                        bar_n = step
-                        within = 0.05 + 0.85 * min(1.0, (finished_steps + step) / DISTILLED_STEPS)
-                        yield Event("progress", f"Segment {i + 1} of {n} · denoising step "
-                                    f"{min(DISTILLED_STEPS, finished_steps + step)}/{DISTILLED_STEPS}",
-                                    fraction=(i + within) / n)
-                    elif line.startswith("[Decoding"):
-                        yield Event("progress", f"Segment {i + 1} of {n} · decoding video + sound",
-                                    fraction=(i + 0.93) / n)
-                    else:
-                        yield Event("log", line)
+                    if line:
+                        log.write(line + "\n")
+                        tail = (tail + [line])[-15:]
+                        yield line
                 log.flush()
             code = self._proc.wait()
         self._proc = None
@@ -393,10 +455,10 @@ class Runner:
                 hint = ("\n\nThe macOS GPU watchdog stopped the render. Turn on \"GPU watchdog workaround\" in "
                         "Settings (and keep the display awake), then press Resume.")
             elif code in (-signal.SIGKILL, 137):
-                hint = ("\n\nmacOS stopped the generator, most likely because it ran out of memory. "
+                hint = ("\n\nmacOS stopped it, most likely because the Mac ran out of memory. "
                         "Try a lower resolution or shorter segments, turn on Low-RAM mode, close other apps, "
                         "then press Resume.")
-            raise _SegmentFailed(f"Segment {i + 1} failed (exit code {code}).{hint}\n\n" + "\n".join(tail))
+            raise _SegmentFailed(f"{what} failed (exit code {code}).{hint}\n\n" + "\n".join(tail))
 
     def _kill(self) -> None:
         proc = self._proc

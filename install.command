@@ -58,6 +58,9 @@ bold "Checking the GPU..."
 .venv/bin/python -m ltx_pipelines_mlx --help >/dev/null
 .venv/bin/python -c "import tdplay.app" >/dev/null
 
+bold "Adding TDPlay AI Video Render to your Applications..."
+.venv/bin/python -m tdplay.macos_bundle
+
 # --- Model --------------------------------------------------------------------------
 bold "Model download"
 echo "TDPlay AI Video Render needs one LTX-2 model pack (about 30-45 GB). You can also do this later in the app's Models tab."
@@ -66,5 +69,6 @@ if [[ ! "${answer}" =~ ^[Nn] ]]; then
   .venv/bin/python -m tdplay download || echo "The download stopped. Run this installer again, or use the Models tab - it continues where it stopped."
 fi
 
-bold "All set! Double-click start.command to open TDPlay AI Video Render."
+bold "All set! Open TDPlay AI Video Render from Applications, Launchpad or Spotlight."
+echo "(start.command still works too: it opens the app in your browser instead of its own window.)"
 read -r -p "Press Return to close." _

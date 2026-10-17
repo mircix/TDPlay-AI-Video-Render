@@ -3,3 +3,5 @@ gradio==6.30.0
 huggingface_hub
 numpy
 pillow
+# the app's own window on macOS (WebKit)
+pywebview==6.2.1; sys_platform == "darwin"
