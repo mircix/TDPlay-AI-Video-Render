@@ -309,6 +309,7 @@ def test_a_lora_reaches_every_block_once_whether_resident_or_streamed(tmp_path, 
     ltx_torch.keep_blocks_on_gpu()
 
     n, resident, strength = 6, frozenset({0, 1, 2}), 0.8
+    torch.manual_seed(0)
     weights = [torch.randn(4, 4) for _ in range(n)]
     a, b = [torch.randn(2, 4) for _ in range(n)], [torch.randn(4, 2) for _ in range(n)]
     path, lora = str(tmp_path / "blocks.safetensors"), str(tmp_path / "lora.safetensors")
@@ -353,12 +354,21 @@ def test_a_lora_reaches_every_block_once_whether_resident_or_streamed(tmp_path, 
     wrapper = BlockStreamingWrapper(model, blocks, gpu, cpu)
 
     x = torch.randn(3, 4)
-    expected = x
-    for w, down, up in zip(weights, a, b, strict=True):
-        expected = expected @ (w + strength * up @ down).T
+
+    def through(lora_times):
+        y = x
+        for w, down, up in zip(weights, a, b, strict=True):
+            y = y @ (w + lora_times * strength * up @ down).T
+        return y
+
+    def off(y, target):  # LTX-2 fuses in bf16: about 1% over six chained layers
+        return float((y - target).norm() / target.norm())
+
+    expected = through(1)
     with torch.inference_mode():
         for _ in range(3):  # resident blocks keep their fused weights, streamed ones are fused again each pass
-            assert torch.allclose(wrapper(x), expected, rtol=0.05, atol=0.05)
+            out = wrapper(x)
+            assert off(out, expected) < 0.03 and off(out, through(0)) > 0.3 and off(out, through(2)) > 0.3
     wrapper.teardown()
 
 

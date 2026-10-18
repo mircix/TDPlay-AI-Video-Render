@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows runners print in cp1252 otherwise
     title, paths = sys.argv[1], sys.argv[2:]
     for path in map(Path, paths):
         try:

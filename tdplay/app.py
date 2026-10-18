@@ -19,7 +19,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from tdplay import __version__, engine, loras, models, scene, worker
+from tdplay import __version__, characters, engine, loras, models, scene, worker
 
 MAX_SEGMENTS = 20
 PROJECTS_DIR = models.HOME / "projects"
@@ -58,6 +58,13 @@ LoRAs are add-ons that change how the model renders the whole shot. Pick up to f
 (0 = off): the two below, or your own LTX-2.3 LoRA files (from Civitai or Hugging Face, the kind ComfyUI uses).
 Most LoRAs were trained on LTX-2.3's full *dev* model and this app runs the faster *distilled* one, so if the picture
 gets noisy or burnt, lower the strength. The *distilled LoRA* itself isn't needed here.
+"""
+
+CHARACTERS_HELP = """
+Save the people in your shots once: a name, a photo (full-body works best) and their clothes and hair. Then
+**Start a shot with them** (their photo becomes the first frame) or **Add them to the scene** (the scene builder,
+for several people in one place). Their clothes and hair go into the Characters box, which reminds the model in
+every segment what they wear.
 """
 
 RAM_GB = models.system_ram_gb()
@@ -187,6 +194,60 @@ def total_text(start_video, n, *seconds) -> str:
     return text
 
 
+def character_gallery() -> list[tuple[str, str]]:
+    return [(str(c.photo), c.name) for c in characters.everyone()]
+
+
+def pick_character(evt: gr.SelectData):
+    """A character was clicked in the library: edit it."""
+    people = characters.everyone()
+    if evt.index is None or not 0 <= int(evt.index) < len(people):
+        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), ""
+    person = people[int(evt.index)]
+    return person.name, str(person.photo), person.notes, str(person.folder), ""
+
+
+def save_character(name, photo, notes, folder):
+    try:
+        person = characters.save(name, notes, photo, folder or None)
+    except (ValueError, OSError) as exc:
+        return gr.skip(), gr.skip(), gr.skip(), f"⚠️ {exc}"
+    return character_gallery(), str(person.photo), str(person.folder), f"Saved **{person.name}**."
+
+
+def delete_character(folder):
+    if not folder:
+        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), "Click a character in the library first."
+    name = characters.load(folder).name
+    characters.delete(folder)
+    return character_gallery(), "", None, "", None, f"Deleted **{name}**."
+
+
+def start_with_character(folder, box):
+    """The character's photo starts the shot, and their line goes into the Characters box."""
+    if not folder:
+        return gr.skip(), gr.skip(), gr.skip(), "Click a character in the library first."
+    person = characters.load(folder)
+    return (str(person.photo), characters.with_line(box, person), gr.Tabs(selected="create"),
+            f"**{person.name}** starts the shot (Create tab).")
+
+
+def add_character_to_scene(folder, *slots):
+    """The character goes into the scene builder's next free slot, with their line as the slot's notes."""
+    n = scene.MAX_CHARACTERS
+    pictures, notes = list(slots[:n]), list(slots[n:])
+    skip = [gr.skip()] * (2 * n + 2)
+    if not folder:
+        return [*skip, "Click a character in the library first."]
+    person = characters.load(folder)
+    if None not in [p or None for p in pictures]:
+        return [*skip, f"The scene has {n} characters already: clear one in the Create tab first."]
+    free = [p or None for p in pictures].index(None)
+    pictures[free], notes[free] = str(person.photo), person.line
+    return [*pictures, *notes, gr.Accordion(open=True), gr.Tabs(selected="create"),
+            f"**{person.name}** is in the scene builder (Create tab), as character {free + 1}."]
+
+
 def spread_characters(*pictures):
     """Spread the characters evenly across the frame whenever one is added or removed."""
     present = [i for i, picture in enumerate(pictures) if picture]
@@ -204,7 +265,7 @@ def build_scene(location, *rest):
     notes, (quality, aspect) = rest[4 * n:5 * n], rest[5 * n:5 * n + 2]
     chosen = [i for i, picture in enumerate(pictures) if picture]
     written = [" ".join(str(notes[i] or "").split()) for i in chosen if str(notes[i] or "").strip()]
-    characters = "\n".join(written) if written else gr.skip()  # the notes go into every segment's prompt
+    notes_box = "\n".join(written) if written else gr.skip()  # the notes go into every segment's prompt
     try:
         if chosen and not _cutter:
             if not scene.cutout_model_path().exists():
@@ -222,7 +283,7 @@ def build_scene(location, *rest):
     except (ValueError, RuntimeError, OSError) as exc:
         yield gr.skip(), gr.skip(), gr.skip(), f"⚠️ {exc}"
         return
-    yield (str(path), gr.skip() if ON_MAC else scene.SCENE_STRENGTH, characters,
+    yield (str(path), gr.skip() if ON_MAC else scene.SCENE_STRENGTH, notes_box,
            "Built: it's now the first frame above. Say what the characters do in segment 1, "
            "or move them with the sliders and build again.")
 
@@ -441,7 +502,7 @@ def _watch(project_dir: str, proc=None, resume_hint: bool = True):
             video, changed, last_push = gr.skip(), False, now
 
 
-def generate(image, start_video, characters, n, *rest):
+def generate(image, start_video, character_notes, n, *rest):
     prompts, seconds = rest[:MAX_SEGMENTS], rest[MAX_SEGMENTS : 2 * MAX_SEGMENTS]
     (preset_key, quality, aspect, low_ram, fast_math, watchdog, anchor, seam, color_lock, seed, out_size,
      up_quality, image_strength) = rest[2 * MAX_SEGMENTS : 2 * MAX_SEGMENTS + 13]
@@ -481,7 +542,7 @@ def generate(image, start_video, characters, n, *rest):
     segments = [engine.Segment(str(p or ""), int(s)) for p, s in zip(prompts[:n], seconds[:n])]
     try:
         project = engine.create_project(projects_dir(), settings, segments, reference_image=image or None,
-                                        start_video=start_video or None, characters=characters or "")
+                                        start_video=start_video or None, characters=character_notes or "")
     except OSError as exc:  # the projects folder is on a drive that's gone, say
         yield status_html(f"Can't save the project in {projects_dir()}: {exc.strerror or exc}. Choose another "
                           "folder in the Projects tab.", tone="error"), None, gr.skip()
@@ -750,7 +811,7 @@ def build() -> gr.Blocks:
                     with gr.Column(scale=5):
                         image = gr.Image(label="Character / first frame (optional)", type="filepath",
                                          sources=["upload", "clipboard"], height=240)
-                        characters = gr.Textbox(
+                        characters_box = gr.Textbox(
                             label="Characters (added to every segment)", lines=2, max_lines=6,
                             placeholder="Mia: black lace slip dress with thin straps, choker, long black hair\n"
                                         "Leo: grey suit, white shirt, short brown hair",
@@ -759,7 +820,7 @@ def build() -> gr.Blocks:
                         with gr.Accordion("…or continue a video you already have", open=False):
                             start_video = gr.Video(label="Start video (any size; it is cropped to the shot size)",
                                                    sources=["upload"], height=200)
-                        with gr.Accordion("…or build it from a location and characters", open=False):
+                        with gr.Accordion("…or build it from a location and characters", open=False) as scene_box:
                             gr.Markdown(SCENE_HELP)
                             scene_location = gr.Image(label="Location (optional)", type="filepath",
                                                       sources=["upload", "clipboard"], height=180)
@@ -869,6 +930,28 @@ def build() -> gr.Blocks:
                             folder_btn = gr.Button("Open project folder", size="sm")
                         log = gr.HTML(log_html([]))
 
+            with gr.Tab("Characters", id="characters") as characters_tab:
+                gr.Markdown(CHARACTERS_HELP)
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=5):
+                        char_gallery = gr.Gallery(character_gallery(), label="Your characters", columns=4, rows=2,
+                                                  height=480, allow_preview=False, object_fit="contain")
+                    with gr.Column(scale=4):
+                        char_folder = gr.State(None)
+                        char_name = gr.Textbox(label="Name", placeholder="Mia")
+                        char_photo = gr.Image(label="Photo", type="filepath", sources=["upload", "clipboard"],
+                                              height=300)
+                        char_notes = gr.Textbox(label="Clothes, hair, look", lines=2, max_lines=4,
+                                                placeholder="black lace slip dress with thin straps, choker, "
+                                                            "long black hair")
+                        with gr.Row():
+                            char_save_btn = gr.Button("Save", variant="primary")
+                            char_new_btn = gr.Button("New character")
+                            char_delete_btn = gr.Button("Delete", variant="stop")
+                        with gr.Row():
+                            char_start_btn = gr.Button("Start a shot with them")
+                            char_scene_btn = gr.Button("Add them to the scene")
+                        char_note = gr.Markdown()
             with gr.Tab("Projects", id="projects") as projects_tab:
                 with gr.Row():
                     folder_box = gr.Textbox(str(projects_dir()), label="New projects are saved in", scale=5)
@@ -943,7 +1026,7 @@ def build() -> gr.Blocks:
         # windows can follow at once (concurrency_limit=None). Starting is guarded by active_job().
         follow = dict(api_visibility="private", show_progress="hidden", concurrency_limit=None)
         go.click(generate,
-                 [image, start_video, characters, n_segments, *prompts, *seconds, preset, quality, aspect, low_ram,
+                 [image, start_video, characters_box, n_segments, *prompts, *seconds, preset, quality, aspect, low_ram,
                   fast_math, watchdog, anchor, seam, color_lock, seed, out_size, up_quality, image_strength,
                   *lora_picks, *lora_strengths],
                  outputs, **follow)
@@ -965,7 +1048,7 @@ def build() -> gr.Blocks:
             picture.change(spread_characters, scene_pictures, scene_across, api_visibility="private", queue=False)
         scene_btn.click(build_scene, [scene_location, *scene_pictures, *scene_across, *scene_down, *scene_size,
                                       *scene_notes, quality, aspect],
-                        [image, image_strength, characters, scene_status], api_visibility="private")
+                        [image, image_strength, characters_box, scene_status], api_visibility="private")
         stop_btn.click(stop, None, status, api_visibility="private", queue=False)
         resume_btn.click(resume_last, [low_ram, fast_math, watchdog], outputs, **follow)
         demo.load(attach, None, outputs, **follow)
@@ -983,6 +1066,21 @@ def build() -> gr.Blocks:
         dl_btn.click(download_models, dl_preset, [dl_status, table], api_visibility="private",
                      show_progress="hidden")
         preset.change(preset_status, preset, status, api_visibility="private")
+        characters_tab.select(character_gallery, None, char_gallery, api_visibility="private", queue=False)
+        char_gallery.select(pick_character, None, [char_name, char_photo, char_notes, char_folder, char_note],
+                            api_visibility="private", queue=False)
+        char_save_btn.click(save_character, [char_name, char_photo, char_notes, char_folder],
+                            [char_gallery, char_photo, char_folder, char_note], api_visibility="private")
+        char_new_btn.click(lambda: ("", None, "", None, ""), None,
+                           [char_name, char_photo, char_notes, char_folder, char_note], api_visibility="private",
+                           queue=False)
+        char_delete_btn.click(delete_character, char_folder,
+                              [char_gallery, char_name, char_photo, char_notes, char_folder, char_note],
+                              api_visibility="private")
+        char_start_btn.click(start_with_character, [char_folder, characters_box],
+                             [image, characters_box, tabs, char_note], api_visibility="private")
+        char_scene_btn.click(add_character_to_scene, [char_folder, *scene_pictures, *scene_notes],
+                             [*scene_pictures, *scene_notes, scene_box, tabs, char_note], api_visibility="private")
         projects_tab.select(refresh_projects, None, project, api_visibility="private")
         projects_tab.select(lambda: str(projects_dir()), None, folder_box, api_visibility="private", queue=False)
         pick_folder_btn.click(pick_projects_dir, folder_box, [folder_box, folder_note, project],
