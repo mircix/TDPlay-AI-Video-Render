@@ -184,7 +184,7 @@ def assemble(video_chunks: list[Path], audio_chunks: list[Path], out_path: str |
     wav_file = work / f".{out_path.stem}_audio.wav"
     # concat-demuxer quoting: a ' inside the path is written as '\''
     quoted = (p.resolve().as_posix().replace("'", "'\\''") for p in video_chunks)
-    list_file.write_text("".join(f"file '{q}'\n" for q in quoted))
+    list_file.write_text("".join(f"file '{q}'\n" for q in quoted), encoding="utf-8")  # ffmpeg reads UTF-8
     with wave.open(str(wav_file), "wb") as w:
         w.setnchannels(CHANNELS)
         w.setsampwidth(2)

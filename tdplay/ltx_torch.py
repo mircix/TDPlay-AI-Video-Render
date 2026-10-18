@@ -245,7 +245,7 @@ def main(argv: list[str] | None = None) -> None:
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 1:
         raise SystemExit("usage: python -m tdplay.ltx_torch JOB.json")
-    render(json.loads(Path(args[0]).read_text()))
+    render(json.loads(Path(args[0]).read_text(encoding="utf-8")))
 
 
 if __name__ == "__main__":

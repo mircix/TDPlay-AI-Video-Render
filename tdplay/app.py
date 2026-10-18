@@ -83,7 +83,7 @@ def _prefs_path() -> Path:
 
 def load_prefs() -> dict:
     try:
-        return json.loads(_prefs_path().read_text())
+        return json.loads(_prefs_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
 
@@ -92,7 +92,7 @@ def save_pref(key: str, value) -> None:
     prefs = load_prefs()
     prefs[key] = value
     _prefs_path().parent.mkdir(parents=True, exist_ok=True)
-    _prefs_path().write_text(json.dumps(prefs, indent=2))
+    _prefs_path().write_text(json.dumps(prefs, indent=2), encoding="utf-8")
 
 
 def theme_pref() -> str:

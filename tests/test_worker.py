@@ -7,6 +7,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -150,3 +151,31 @@ def test_a_new_window_shows_the_running_job(tmp_path, monkeypatch):
     assert app.active_job() is None
     # Opened again after it finished: the window shows how it ended.
     assert "Done!" in list(app.attach())[-1][0]
+
+
+def test_prompts_and_progress_bars_whatever_the_system_text_encoding(tmp_path):
+    """Windows writes text in its legacy code page unless told otherwise; prompts and tqdm's bars aren't in it."""
+    prompt = "Søren läuft weiter — 走り続ける"
+    code = textwrap.dedent(f"""
+        import locale
+        from tdplay import engine, worker
+        print("system encoding:", locale.getpreferredencoding(False))
+        settings = engine.Settings(width=512, height=256, model_dir="/models/pack", gemma_dir="/models/gemma", seed=7)
+        project = engine.create_project({str(tmp_path)!r}, settings, [engine.Segment({prompt!r}, 2), engine.Segment("b", 1)])
+        proc = worker.start(project.dir, ["render"])
+        for event in worker.follow(project.dir, proc, poll=0.1):
+            if event is not None and event.kind in ("done", "error", "stopped"):
+                print("RESULT", event.kind, event.text.splitlines()[0])
+        print("PROMPT KEPT", engine.Project.load(project.dir).segments[0].prompt == {prompt!r})
+        print("LOG HAS BARS", "█" in (project.dir / "log.txt").read_text(encoding="utf-8"))
+    """)
+    # A plain "C" locale makes Python's default text encoding ASCII on Linux and macOS, like cp1252 on Windows.
+    env = dict(os.environ, PYTHONPATH=str(ROOT), LC_ALL="C", LANG="C", PYTHONCOERCECLOCALE="0", PYTHONUTF8="0",
+               PYTHONIOENCODING="utf-8")
+    script = tmp_path / "render.py"  # a file, not -c: command lines are decoded in the system encoding too
+    script.write_text(code, encoding="utf-8")
+    out = subprocess.run([sys.executable, str(script)], env=env, capture_output=True, text=True, encoding="utf-8",
+                         timeout=180)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "utf" not in out.stdout.splitlines()[0].lower(), out.stdout  # really a non-UTF-8 default
+    assert "RESULT done" in out.stdout and "PROMPT KEPT True" in out.stdout and "LOG HAS BARS True" in out.stdout, out.stdout

@@ -90,7 +90,7 @@ def start(project_dir: str | Path, job: list[str]) -> subprocess.Popen:
     python = Path(sys.executable)
     if python.name.lower() == "pythonw.exe" and python.with_name("python.exe").exists():
         python = python.with_name("python.exe")  # its output goes to worker.log; no console window either way
-    env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8",
+    env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", PYTHONUTF8="1",
                PYTHONPATH=os.pathsep.join(filter(None, [str(engine.APP_ROOT), os.environ.get("PYTHONPATH")])))
     cmd = [str(python), "-m", "tdplay.worker", str(d), *job]
     with open(d / LOG, "ab") as log:

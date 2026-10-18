@@ -32,7 +32,9 @@ for i, size in enumerate(sizes):
     print(f"SEGMENT {i + 1}/{len(sizes)}", flush=True)
     for total_steps in (8, 3):
         for s in range(total_steps + 1):
-            print(f"\r{100 * s // total_steps:3d}%|##| {s}/{total_steps} [00:00<00:00]", end="", file=sys.stderr, flush=True)
+            bar = "█" * (10 * s // total_steps)  # tqdm's own characters when its output is UTF-8
+            print(f"\r{100 * s // total_steps:3d}%|{bar:<10}| {s}/{total_steps} [00:00<00:00]", end="",
+                  file=sys.stderr, flush=True)
             time.sleep(delay)
         print(file=sys.stderr)
     if os.environ.get("FAKE_LTX_FAIL_ON") == str(i + 1):

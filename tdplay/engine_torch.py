@@ -91,7 +91,7 @@ class TorchRunner(Runner):
             p.save()
             job = self.job()
             job_path = p.path("job.json")
-            job_path.write_text(json.dumps(job, indent=2))
+            job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
             ends = segment_ends(job["first_frames"], job["new_frames"])
             env = dict(os.environ, PYTHONUNBUFFERED="1", HF_HUB_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1",
                        PYTORCH_HIP_ALLOC_CONF="expandable_segments:True",

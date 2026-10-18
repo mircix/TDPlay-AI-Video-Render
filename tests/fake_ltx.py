@@ -93,7 +93,9 @@ def read(path: str) -> tuple[np.ndarray, int, int, int]:
 def steps(total: int) -> None:
     delay = float(os.environ.get("FAKE_LTX_SLEEP", "0"))
     for i in range(total + 1):
-        print(f"\rDenoising: {100 * i // total:3d}%|####| {i}/{total} [00:00<00:00, 9.9it/s]", end="", file=sys.stderr)
+        bar = "█" * (10 * i // total) + "▌" * (i < total)  # tqdm's own characters when its output is UTF-8
+        print(f"\rDenoising: {100 * i // total:3d}%|{bar:<10}| {i}/{total} [00:00<00:00, 9.9it/s]", end="",
+              file=sys.stderr)
         sys.stderr.flush()
         time.sleep(delay)
     print(file=sys.stderr)

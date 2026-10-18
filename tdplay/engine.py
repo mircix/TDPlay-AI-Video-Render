@@ -119,13 +119,13 @@ class Project:
         data = asdict(self)
         data.pop("dir")
         tmp = self.dir / "project.json.tmp"
-        tmp.write_text(json.dumps(data, indent=2))
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         tmp.replace(self.dir / "project.json")
 
     @classmethod
     def load(cls, directory: str | Path) -> Project:
         directory = Path(directory)
-        data = json.loads((directory / "project.json").read_text())
+        data = json.loads((directory / "project.json").read_text(encoding="utf-8"))
         data["settings"] = Settings(**data["settings"])
         data["segments"] = [Segment(**s) for s in data["segments"]]
         return cls(dir=directory, **data)
@@ -464,8 +464,11 @@ class Runner:
         if self._stop.is_set():
             raise _Stopped
         tail: list[str] = []
-        env = dict(env, PYTHONPATH=os.pathsep.join(filter(None, [str(APP_ROOT), env.get("PYTHONPATH")])))
-        with self.project.path("log.txt").open("a") as log:
+        env = dict(env, PYTHONPATH=os.pathsep.join(filter(None, [str(APP_ROOT), env.get("PYTHONPATH")])),
+                   # UTF-8 for the helper's output and files, not Windows' legacy code page: progress bars and
+                   # prompts aren't in it.
+                   PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        with self.project.path("log.txt").open("a", encoding="utf-8", errors="replace") as log:
             log.write(f"\n$ {shlex.join(cmd)}\n")
             self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
                                           cwd=self.project.dir, start_new_session=os.name != "nt", **media.NO_WINDOW)

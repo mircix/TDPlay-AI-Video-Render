@@ -202,7 +202,7 @@ def is_downloaded(repo: str) -> bool:
     if not manifest.exists():
         return False
     root = local_dir(repo)
-    for line in manifest.read_text().splitlines()[1:]:
+    for line in manifest.read_text(encoding="utf-8").splitlines()[1:]:
         name, _, size = line.rpartition("\t")
         path = root / name
         if not path.exists() or path.stat().st_size != int(size):
@@ -275,7 +275,7 @@ def download(repo: str, patterns: tuple[str, ...] | None = None, *,
     if error:
         raise error[0]
     lines = [revision] + [f"{name}\t{(dest / name).stat().st_size}" for name, _ in files]
-    _manifest(repo).write_text("\n".join(lines) + "\n")
+    _manifest(repo).write_text("\n".join(lines) + "\n", encoding="utf-8")
     yield DownloadProgress(repo, total, total, finished=True, initial_bytes=initial)
 
 
