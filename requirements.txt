@@ -3,5 +3,7 @@ gradio==6.30.0
 huggingface_hub
 numpy
 pillow
+# the scene builder's cut-out model (ISNet) runs on ONNX Runtime
+onnxruntime==1.30.0
 # the app's own window on macOS (WebKit)
 pywebview==6.2.1; sys_platform == "darwin"

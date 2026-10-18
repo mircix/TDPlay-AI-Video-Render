@@ -5,6 +5,7 @@
 1. The app's server starts from the installed code and serves its page.
 2. A two-segment shot renders as a background job through the installed code, with the stand-in
    model from this folder (no GPU or model weights needed), and comes out with every frame.
+3. The scene builder downloads its cut-out model, runs it on ONNX Runtime and builds a first frame.
 """
 
 from __future__ import annotations
@@ -67,6 +68,26 @@ def check_render(home: Path) -> None:
     print(f"   ffmpeg: {media.tool('ffmpeg')}", flush=True)
 
 
+def check_scene(home: Path) -> None:
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    from tdplay import scene
+
+    figure = Image.new("RGB", (600, 800), (230, 230, 232))
+    ImageDraw.Draw(figure).rectangle((240, 150, 360, 760), fill=(40, 60, 140))
+    figure.save(home / "figure.png")
+    cutter = scene.Cutter()  # downloads the model into TDPLAY_HOME and checks its checksum
+    mask = cutter(figure)
+    assert mask[300:700, 260:340].mean() > 0.9 and mask[:, :150].mean() < 0.1, "the cut-out model missed the figure"
+    built = scene.build(None, [str(home / "figure.png")], [scene.Placement()], 1024, 576, home / "scenes",
+                        cutter=cutter)
+    with Image.open(built) as picture:
+        assert picture.size == (1920, 1080)
+        assert np.asarray(picture)[700, 960, 2] > 100  # the figure stands in the middle
+    print("Scene builder OK.")
+
+
 def main() -> None:
     app_root = Path(sys.argv[1]).resolve()
     sys.path.insert(0, str(app_root))  # the installed code, not this checkout's
@@ -84,6 +105,7 @@ def main() -> None:
     os.environ.update(env)
     check_server(app_root, env)
     check_render(home)
+    check_scene(home)
     print("Smoke test passed.")
 
 

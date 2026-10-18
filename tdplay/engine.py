@@ -127,6 +127,8 @@ class Settings:
     seed: int = -1
     #: Strength of the character photo re-applied at the end of every extended segment (0 = off).
     anchor_strength: float = 0.0
+    #: torch backend: how closely the first frame follows the photo (under 1 lets the model repaint it a little).
+    image_strength: float = 1.0
     #: Frames over which the end of the previous segment is blended into the model's re-decode.
     seam_frames: int = 8
     #: Cancel the small color shift the VAE round trip adds at every seam.

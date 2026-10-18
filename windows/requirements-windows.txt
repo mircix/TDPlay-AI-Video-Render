@@ -16,4 +16,6 @@ huggingface_hub
 numpy
 pillow
 pywebview==6.2.1
+# the scene builder's cut-out model (ISNet) runs on ONNX Runtime
+onnxruntime==1.30.0
 spandrel

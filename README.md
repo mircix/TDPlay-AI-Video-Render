@@ -60,7 +60,8 @@ being made keeps going.
 ## Make a long take
 
 1. *(Optional)* Drop in a **character / first-frame photo**. Segment 1 starts from it.
-   Or open *"…or continue a video you already have"* to extend one of your own clips.
+   Or open *"…or continue a video you already have"* to extend one of your own clips, or *"…or build it from a
+   location and characters"* to put up to three people in a place (see below).
 2. Pick the number of **segments** and write **one prompt per segment**, each with a length in seconds.
 3. Press **Generate**. The shot so far appears after every segment, so you can watch it grow.
 4. The finished `render.mp4` is in the project folder (**Open project folder**).
@@ -68,6 +69,19 @@ being made keeps going.
 **Renders run in the background.** Close the window or quit the app whenever you like: the video keeps being made,
 and you get a notification when it's done. Open the app again to see the progress or the result. Only **Stop** stops
 it.
+
+### Several characters in a place
+
+LTX-2 takes a picture only as the video's first frame: it has no "this is what a character looks like" input. So
+*"…or build it from a location and characters"* builds that first frame for you. Add a **location** picture and up
+to three **character** photos; each character is cut out of their photo (ISNet, a small background-removal model,
+downloaded once: 180 MB) and placed on the location, taking on a little of its light. Move them with **Left ↔ right**,
+**Feet** (lower is nearer the camera) and **Size**, then press **Build the first frame**: the result replaces the
+first-frame photo, and you can build again until it looks right. Full-body photos work best for people who stand in
+the scene. Name the characters and say what they do in segment 1.
+
+A pasted-in person can still look pasted in. On Windows, building a scene also sets **First frame strength**
+(Settings) to 0.85, so the model repaints the first frame a little and blends the light; 1 keeps it exactly as built.
 
 ### 1080p and 4K
 

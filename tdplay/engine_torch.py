@@ -74,7 +74,7 @@ class TorchRunner(Runner):
         if p.reference_image:
             photo = str(p.path(p.reference_image))
             if not p.start_video:  # the photo starts the shot
-                images.append({"path": photo, "frame": 0, "strength": 1.0})
+                images.append({"path": photo, "frame": 0, "strength": s.image_strength})
             if s.anchor_strength > 0:  # and re-anchors the last frame of every segment it didn't start
                 images += [{"path": photo, "frame": end - 1, "strength": s.anchor_strength}
                            for end in (ends if p.start_video else ends[1:])]

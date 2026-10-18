@@ -91,3 +91,28 @@ def test_graphics_memory_choice_reaches_the_render(tmp_path, monkeypatch):
     assert project.settings.gpu_memory == "max" and TorchRunner(project).job()["gpu_memory"] == "max"
     app.save_pref("gpu_memory", "everything")
     assert app.gpu_memory_pref() == "balanced"
+
+
+def test_scene_builder_makes_the_first_frame(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from tdplay import app, models
+    from test_scene import BLUE, RED, fake_cutter, photo
+
+    monkeypatch.setattr(models, "HOME", tmp_path)
+    monkeypatch.setattr(app, "_cutter", [fake_cutter])
+    monkeypatch.setattr(app, "ON_MAC", False)
+    first, second = photo(tmp_path, "a.png", RED), photo(tmp_path, "b.png", BLUE)
+    # Adding characters spreads them across the frame.
+    updates = app.spread_characters(None, first, second)
+    assert [u.get("value") for u in updates] == [None, 33, 67]
+
+    picture, strength, note = list(app.build_scene(None, None, first, second, 25, 33, 67, 95, 95, 95, 70, 70, 70,
+                                                   "576p", "16:9 landscape"))[-1]
+    assert Path(picture).parent == tmp_path / "scenes" and "first frame above" in note
+    assert strength == 0.85  # so the model may repaint the pasted-in light a little
+    with Image.open(picture) as built:
+        assert built.size == (1920, 1080)
+    *_, (_, _, note) = app.build_scene(None, None, None, None, 25, 50, 75, 95, 95, 95, 70, 70, 70, "576p",
+                                       "16:9 landscape")
+    assert note.startswith("⚠️ Add a location picture")

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from tdplay import __version__, engine, models, worker
+from tdplay import __version__, engine, models, scene, worker
 
 MAX_SEGMENTS = 20
 PROJECTS_DIR = models.HOME / "projects"
@@ -43,6 +43,13 @@ TIPS = """
 **How to write segments.** Each segment continues the last second of the one before it, picture *and* sound.
 Start every prompt after the first by continuing the action: *same pace, same camera*. Describe sound too
 (footsteps, rain, music) — the model makes audio. Put joins mid-movement (mid-walk, mid-pan), never on a cut or a doorway.
+"""
+
+SCENE_HELP = """
+LTX-2 takes a picture only as the video's first frame, so this builds one: each character is cut out of their
+photo and placed on the location. *Left ↔ right* moves a character across, *Feet* sets where they stand (lower is
+nearer the camera), *Size* is their height in the frame. Full-body photos work best for people who stand in the
+scene. Then say in segment 1 who they are and what they do. The first build downloads the cut-out model (180 MB).
 """
 
 RAM_GB = models.system_ram_gb()
@@ -157,6 +164,43 @@ def total_text(start_video, n, *seconds) -> str:
     return text
 
 
+def spread_characters(*pictures):
+    """Spread the characters evenly across the frame whenever one is added or removed."""
+    present = [i for i, picture in enumerate(pictures) if picture]
+    across = {i: round(100 * scene.default_x(k, len(present))) for k, i in enumerate(present)}
+    return [gr.update(value=across[i]) if i in across else gr.skip() for i in range(len(pictures))]
+
+
+_cutter: list = []  # the cut-out model, loaded on the first build
+
+
+def build_scene(location, *rest):
+    """Build the first frame from the location and characters; it replaces the picture above."""
+    n = scene.MAX_CHARACTERS
+    pictures, across, down, sizes = rest[:n], rest[n:2 * n], rest[2 * n:3 * n], rest[3 * n:4 * n]
+    quality, aspect = rest[4 * n:4 * n + 2]
+    chosen = [i for i, picture in enumerate(pictures) if picture]
+    try:
+        if chosen and not _cutter:
+            if not scene.cutout_model_path().exists():
+                yield gr.skip(), gr.skip(), "Downloading the cut-out model (180 MB, only once)…"
+            _cutter.append(scene.Cutter())
+        width, height = resolution(quality, aspect)
+        placements = [scene.Placement(x=across[i] / 100, y=down[i] / 100, size=sizes[i] / 100) for i in chosen]
+        path = scene.build(location or None, [pictures[i] for i in chosen], placements, width, height,
+                           models.HOME / "scenes", cutter=_cutter[0] if _cutter else None)
+    except ImportError:
+        fix = "the repair setup in the Start menu" if os.name == "nt" else "the app's setup again"
+        yield gr.skip(), gr.skip(), f"⚠️ The cut-out model needs ONNX Runtime, which isn't installed: run {fix}."
+        return
+    except (ValueError, RuntimeError, OSError) as exc:
+        yield gr.skip(), gr.skip(), f"⚠️ {exc}"
+        return
+    yield (str(path), gr.skip() if ON_MAC else scene.SCENE_STRENGTH,
+           "Built: it's now the first frame above. Describe the characters and what they do in segment 1, "
+           "or move them with the sliders and build again.")
+
+
 def status_html(title: str, fraction: float | None = None, detail: str = "", tone: str = "info") -> str:
     bar = ""
     if fraction is not None:
@@ -268,7 +312,7 @@ def _watch(project_dir: str, proc=None, resume_hint: bool = True):
 def generate(image, start_video, n, *rest):
     prompts, seconds = rest[:MAX_SEGMENTS], rest[MAX_SEGMENTS : 2 * MAX_SEGMENTS]
     (preset_key, quality, aspect, low_ram, fast_math, watchdog, anchor, seam, color_lock, seed, out_size,
-     up_quality) = rest[2 * MAX_SEGMENTS :]
+     up_quality, image_strength) = rest[2 * MAX_SEGMENTS :]
     n = int(n)
     if ON_MAC and not IS_APPLE_SILICON and not os.environ.get("TDPLAY_LTX_CMD"):
         yield (status_html("TDPlay AI Video Render needs a Mac with Apple Silicon (M1 or newer) to generate.",
@@ -289,7 +333,7 @@ def generate(image, start_video, n, *rest):
         backend=BACKEND, upsampler=upsampler, offload="disk" if low_ram else "cpu",
         fast_math=bool(fast_math), seed=int(seed if seed is not None else -1), anchor_strength=float(anchor),
         seam_frames=int(seam), color_lock=bool(color_lock), gpu_watchdog_fix=bool(watchdog),
-        upscale=out_size or "off", upscale_quality=up_quality or "fast",
+        upscale=out_size or "off", upscale_quality=up_quality or "fast", image_strength=float(image_strength),
     )
     segments = [engine.Segment(str(p or ""), int(s)) for p, s in zip(prompts[:n], seconds[:n])]
     try:
@@ -504,6 +548,25 @@ def build() -> gr.Blocks:
                         with gr.Accordion("…or continue a video you already have", open=False):
                             start_video = gr.Video(label="Start video (any size; it is cropped to the shot size)",
                                                    sources=["upload"], height=200)
+                        with gr.Accordion("…or build it from a location and characters", open=False):
+                            gr.Markdown(SCENE_HELP)
+                            scene_location = gr.Image(label="Location (optional)", type="filepath",
+                                                      sources=["upload", "clipboard"], height=180)
+                            scene_pictures, scene_across, scene_down, scene_size = [], [], [], []
+                            with gr.Row():
+                                for i in range(scene.MAX_CHARACTERS):
+                                    with gr.Column(min_width=150):
+                                        scene_pictures.append(gr.Image(
+                                            label=f"Character {i + 1}", type="filepath",
+                                            sources=["upload", "clipboard"], height=150))
+                                        scene_across.append(gr.Slider(
+                                            0, 100, value=round(100 * scene.default_x(i, scene.MAX_CHARACTERS)),
+                                            step=1, label="Left ↔ right"))
+                                        scene_down.append(gr.Slider(20, 100, value=95, step=1,
+                                                                    label="Feet: up ↔ down"))
+                                        scene_size.append(gr.Slider(10, 100, value=70, step=1, label="Size"))
+                            scene_btn = gr.Button("Build the first frame")
+                            scene_status = gr.Markdown()
                         gr.Markdown(TIPS)
                         n_segments = gr.Slider(1, MAX_SEGMENTS, value=3, step=1, label="Segments")
                         groups, prompts, seconds = [], [], []
@@ -545,6 +608,10 @@ def build() -> gr.Blocks:
                                                label="Keep the character's face: re-anchor the photo every segment",
                                                info="0 = off. 0.5–0.7 stops face drift, but pulls each segment's "
                                                     "last frame toward the photo's pose and framing.")
+                            image_strength = gr.Slider(
+                                0.5, 1, value=1.0, step=0.05, label="First frame strength", visible=not ON_MAC,
+                                info="1 = the video starts exactly on the picture. About 0.85 lets the model repaint "
+                                     "it a little, which blends the light of a built scene.")
                             # The PyTorch backend blends the joins inside LTX-2, so these are Mac-only.
                             seam = gr.Slider(0, 16, value=8, step=1, label="Seam blend (frames)", visible=ON_MAC)
                             color_lock = gr.Checkbox(True, label="Color lock at seams", visible=ON_MAC,
@@ -640,8 +707,13 @@ def build() -> gr.Blocks:
         follow = dict(api_visibility="private", show_progress="hidden", concurrency_limit=None)
         go.click(generate,
                  [image, start_video, n_segments, *prompts, *seconds, preset, quality, aspect, low_ram, fast_math,
-                  watchdog, anchor, seam, color_lock, seed, out_size, up_quality],
+                  watchdog, anchor, seam, color_lock, seed, out_size, up_quality, image_strength],
                  outputs, **follow)
+        for picture in scene_pictures:
+            picture.change(spread_characters, scene_pictures, scene_across, api_visibility="private", queue=False)
+        scene_btn.click(build_scene, [scene_location, *scene_pictures, *scene_across, *scene_down, *scene_size,
+                                      quality, aspect], [image, image_strength, scene_status],
+                        api_visibility="private")
         stop_btn.click(stop, None, status, api_visibility="private", queue=False)
         resume_btn.click(resume_last, [low_ram, fast_math, watchdog], outputs, **follow)
         demo.load(attach, None, outputs, **follow)
