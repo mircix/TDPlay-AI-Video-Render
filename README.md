@@ -147,7 +147,7 @@ the lower resolutions. 8–12 GB cards are likely too small.
    protected your PC": **More info** → **Run anyway**. It installs for your user only (no administrator rights),
    into `%LOCALAPPDATA%\Programs\TDPlay AI Video Render`.
 2. After copying the app, a setup window finds your graphics card and installs
-   [uv](https://docs.astral.sh/uv/) (which installs Python 3.13), ffmpeg, Lightricks' LTX-2 code, and **AMD's ROCm
+   Python 3.13 (python.org's build), [uv](https://docs.astral.sh/uv/), ffmpeg, Lightricks' LTX-2 code, and **AMD's ROCm
    PyTorch for your card** (RX 7900 → `gfx1100`, RX 7800/7700 → `gfx1101`, RX 7600 → `gfx1102`, RX 9060 →
    `gfx1200`, RX 9070 / R9700 → `gfx1201`).
    It then checks that PyTorch can see the GPU, and offers to download the model (about 55 GB). You can also do that

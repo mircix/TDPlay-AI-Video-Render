@@ -22,7 +22,12 @@ Set-Location $Root
 $LtxTag = "v1.4.2"                                  # Lightricks LTX-2 release this version is built against
 $RocmIndex = "https://stable.repo.amd.com/rocm/whl-next/"
 $TorchRocm = "2.13.0+rocm10.0.0"; $VisionRocm = "0.28.0+rocm10.0.0"; $AudioRocm = "2.11.0.2+rocm10.0.0"
-$PyVersion = "3.13"
+# Python itself: the official python.org build as published on NuGet (a portable zip), kept next to the
+# app. Not uv's own Python: uv links its Pythons with a directory junction, which Windows refuses to
+# follow in some setups ("untrusted mount point", error 448).
+$PyVersion = "3.13.16"
+$PyUrl = "https://api.nuget.org/v3-flatcontainer/python/3.13.16/python.3.13.16.nupkg"
+$PySha256 = "95fad176338f1d6a799e45946488063f4aa61764e6cff2f132ddeffbf7a04c34"
 $UvVersion = "0.12.23"
 $UvUrl = "https://files.pythonhosted.org/packages/af/fd/816f4e8a76197312ec8037369e5b5c8a5ebde7aa118b6250259e031d3444/uv-0.12.23-py3-none-win_amd64.whl"
 $UvSha256 = "fb8a4117a5224d73abe2204a1e744ae34b544f1b9a0b761576851deaa7215c12"
@@ -167,8 +172,28 @@ if (-not ((Test-Path $marker) -and ((Get-Content $marker -Raw).Trim() -eq $LtxTa
 }
 
 # --- Python environment ------------------------------------------------------------------------
-Say "Setting up Python $PyVersion..."
-& $uv venv --allow-existing --seed --managed-python --python $PyVersion .venv
+$pyHome = Join-Path $vendor "python"
+$pyMarker = Join-Path $pyHome ".tdplay-version"
+if (-not ((Test-Path $pyMarker) -and ((Get-Content $pyMarker -Raw).Trim() -eq $PyVersion))) {
+    Say "Getting Python $PyVersion..."
+    $zip = Join-Path $env:TEMP "tdplay-python.zip"
+    $unzip = Join-Path $env:TEMP "tdplay-python"
+    Get-Download $PyUrl $zip $PySha256
+    if (Test-Path $unzip) { Remove-Item $unzip -Recurse -Force }
+    Expand-Zip $zip $unzip
+    if (Test-Path $pyHome) { Remove-Item $pyHome -Recurse -Force }
+    Move-Item (Join-Path $unzip "tools") $pyHome
+    Set-Content -Path $pyMarker -Value $PyVersion
+    Remove-Item $zip, $unzip -Recurse -Force
+}
+# An environment made from another Python (an older version of this setup) is made again.
+$cfg = Join-Path $Root ".venv\pyvenv.cfg"
+if ((Test-Path $cfg) -and -not (Select-String -Path $cfg -SimpleMatch -Quiet -Pattern $pyHome)) {
+    Remove-Item (Join-Path $Root ".venv") -Recurse -Force
+}
+Say "Setting up the Python environment..."
+$env:UV_PYTHON_DOWNLOADS = "never"
+& $uv venv --allow-existing --seed --python (Join-Path $pyHome "python.exe") .venv
 Check "Creating the Python environment"
 $py = Join-Path $Root ".venv\Scripts\python.exe"
 
