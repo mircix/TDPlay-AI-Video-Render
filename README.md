@@ -169,8 +169,9 @@ weights stream from the SSD instead of being held in memory, which is what makes
 as fits stays on the graphics card for the whole render, and only the rest streams from the SSD: the log says
 how much ("GPU: keeping 26 of 48 transformer blocks on the card"). The more of it stays on the card, the faster. The
 model never takes more than 80 % of the card's memory: Windows, the display and your other apps need the rest, and
-when a card runs out, Windows makes everything crawl and the display driver can crash. 704p (1280×704) is worth
-trying on a 24 GB card.
+when a card runs out, Windows makes everything crawl and the display driver can crash. *Graphics card memory:
+Maximum* in Settings raises that to 90 % for more speed; close games and other GPU-heavy apps while it renders, and
+go back to Balanced if the screen flickers or goes black. 704p (1280×704) is worth trying on a 24 GB card.
 
 ### How the Windows version differs
 

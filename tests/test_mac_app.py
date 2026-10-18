@@ -70,3 +70,24 @@ def test_open_folder_shows_the_project_in_the_file_manager(tmp_path, monkeypatch
     monkeypatch.setattr(app.subprocess, "Popen", lambda cmd, **kwargs: opened.append(cmd))
     app.open_folder()
     assert opened[-1] == ["open", str(project)]
+
+
+def test_graphics_memory_choice_reaches_the_render(tmp_path, monkeypatch):
+    from tdplay import app, engine, models, worker
+    from tdplay.engine_torch import TorchRunner
+
+    monkeypatch.setattr(models, "HOME", tmp_path)
+    monkeypatch.setattr(app, "ON_MAC", False)
+    monkeypatch.setitem(app._state, "job", None)
+    monkeypatch.setattr(worker, "start", lambda project_dir, job: None)
+    monkeypatch.setattr(app, "_watch", lambda *args: iter([("watching", None, None)]))
+    settings = engine.Settings(width=512, height=256, model_dir="", gemma_dir="", backend="torch")
+    project = engine.create_project(tmp_path / "projects", settings, [engine.Segment("a", 2)])
+    assert app.gpu_memory_pref() == "balanced"
+    app.save_pref("gpu_memory", "max")
+    assert app.gpu_memory_pref() == "max"
+    list(app._start(project, ["render"]))  # Create or Resume: the setting in effect is saved with the project
+    project = engine.Project.load(project.dir)
+    assert project.settings.gpu_memory == "max" and TorchRunner(project).job()["gpu_memory"] == "max"
+    app.save_pref("gpu_memory", "everything")
+    assert app.gpu_memory_pref() == "balanced"

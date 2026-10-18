@@ -252,7 +252,8 @@ def fake_gpu(monkeypatch):
         monkeypatch.setattr(cls, name, getattr(cls, name))
     monkeypatch.setattr(ltx_torch, "_working_bytes_per_token", {})
     monkeypatch.setattr(ltx_torch, "_extra_reserve", {})
-    card = SimpleNamespace(free=21 * gb, allocated=2 * gb, peak=4 * gb, share=0.8, pools=[], fraction=None)
+    monkeypatch.setattr(ltx_torch, "MIN_RESERVE_GB", dict(ltx_torch.GPU_MEMORY["balanced"][1]))
+    card = SimpleNamespace(free=21 * gb, allocated=2 * gb, peak=4 * gb, pools=[], fraction=0.8)
 
     class Pool:  # stands in for a GPU buffer pool
         def __init__(self, slot_nbytes, capacity, device, **kwargs):
@@ -269,7 +270,7 @@ def fake_gpu(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction",
                         lambda fraction, device=None: setattr(card, "fraction", fraction))
-    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda device=None: card.share)
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda device=None: card.fraction)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device=None: SimpleNamespace(total_memory=24 * gb))
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (card.free, 24 * gb))
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: card.allocated)
@@ -297,10 +298,12 @@ def test_resident_blocks_leave_the_rest_of_the_card_alone(fake_gpu, monkeypatch,
 
     gb = 2**30
     ltx_torch.limit_gpu_memory()
-    assert fake_gpu.fraction == ltx_torch.GPU_MEMORY_SHARE == 0.8
+    assert fake_gpu.fraction == 0.8
     monkeypatch.setenv("TDPLAY_GPU_MEMORY_SHARE", "0.6")
     ltx_torch.limit_gpu_memory()
     assert fake_gpu.fraction == 0.6
+    monkeypatch.delenv("TDPLAY_GPU_MEMORY_SHARE")
+    ltx_torch.limit_gpu_memory()
 
     # 21 GB free, but only 0.8 * 24 - 2 = 17.2 GB within the share: 6 GB working memory, 2 slots, 26 blocks.
     first = fake_gpu.run()
@@ -316,6 +319,21 @@ def test_resident_blocks_leave_the_rest_of_the_card_alone(fake_gpu, monkeypatch,
     fake_gpu.peak = 12 * gb
     fake_gpu.run()
     assert fake_gpu.run() == int((17.2 * gb - 13.5 * gb - 2 * int(0.39 * gb)) // int(0.39 * gb)) == 7
+
+
+def test_maximum_graphics_memory_keeps_more_blocks_on_the_card(fake_gpu):
+    from tdplay import ltx_torch
+
+    gb, slot = 2**30, int(0.39 * 2**30)
+    balanced = fake_gpu.run(), fake_gpu.run("refine")
+    ltx_torch.limit_gpu_memory("max")
+    assert fake_gpu.fraction == 0.9
+    # 0.9 * 24 - 2 = 19.6 GB within the share; 4 GB (draft) / 8 GB (refine) working memory, 2 slots.
+    maximum = fake_gpu.run(), fake_gpu.run("refine")
+    assert maximum == tuple(int((19.6 * gb - reserve * gb - 2 * slot) // slot) for reserve in (4, 8)) == (38, 27)
+    assert maximum[0] > balanced[0] and maximum[1] > balanced[1]
+    ltx_torch.limit_gpu_memory("something else")  # an unknown setting is the balanced one
+    assert fake_gpu.fraction == 0.8 and (fake_gpu.run(), fake_gpu.run("refine")) == balanced
 
 
 def test_a_pass_that_runs_out_of_memory_runs_again_with_more_room(fake_gpu, capsys):

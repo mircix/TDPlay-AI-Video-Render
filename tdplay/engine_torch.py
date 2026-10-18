@@ -68,6 +68,7 @@ class TorchRunner(Runner):
             "first_frames": first, "new_frames": new, "images": images,
             "checkpoint": find_checkpoint(s.model_dir) if s.model_dir else "",
             "gemma_root": s.gemma_dir, "upsampler": s.upsampler, "offload": s.offload,
+            "gpu_memory": s.gpu_memory,
         }
 
     def _stopped_text(self) -> str:

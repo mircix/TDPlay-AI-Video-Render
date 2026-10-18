@@ -208,17 +208,22 @@ def stream_without_scale_keys() -> None:
 # runs the blocks in order, so with Low-RAM mode each step reads the whole transformer from disk again while
 # most of the GPU's memory sits unused. These patches keep as many blocks as fit on the GPU for a whole pass
 # and stream only the rest. The pass's working memory (activations) must still fit: a reserve is left free
-# for it, at least MIN_RESERVE_GB and more if a pass of that kind measurably needed more.
+# for it, at least a minimum and more if a pass of that kind measurably needed more.
 #
 # The model never gets the whole card, though. The display runs on it too, and when a card's memory runs out
 # Windows doesn't fail the allocation: it moves memory to system RAM, which slows everything to a crawl and
-# can make the display driver hang (black screens, a restart). So the model is held to GPU_MEMORY_SHARE of
-# the card (PyTorch enforces it); a pass that runs out of memory within that is run again with more room.
+# can make the display driver hang (black screens, a restart). So the model is held to a share of the card
+# (PyTorch enforces it); a pass that runs out of memory within that is run again with more room.
 
-#: Share of the graphics card's memory the model may use; the rest is left to Windows and other apps.
-GPU_MEMORY_SHARE = 0.8
-#: GPU memory kept free for a pass's working memory, at least (the first segment's passes ran fine with it).
-MIN_RESERVE_GB = {"draft": 6.0, "refine": 10.0}
+#: The "Graphics card memory" setting: the share of the card the model may use, and the least working memory
+#: kept free in a draft / refine pass. On a 24 GB card "max" keeps 44 / 33 of the 48 blocks on it, as many as
+#: ran fine without the share; "balanced" leaves Windows and other apps more room.
+GPU_MEMORY = {
+    "balanced": (0.8, {"draft": 6.0, "refine": 10.0}),
+    "max": (0.9, {"draft": 4.0, "refine": 8.0}),
+}
+#: The minimum working memory in effect (set by limit_gpu_memory).
+MIN_RESERVE_GB = dict(GPU_MEMORY["balanced"][1])
 #: More working memory a pass gets each time it ran out, and how often it is tried again.
 OOM_STEP_GB = 4.0
 OOM_RETRIES = 3
@@ -275,12 +280,14 @@ def gpu_reserve(kind: str, tokens: int) -> int:
     return int(reserve) + _extra_reserve.get(kind, 0)
 
 
-def limit_gpu_memory() -> None:
+def limit_gpu_memory(setting: str = "balanced") -> None:
     """Hold the model to its share of the graphics card (``TDPLAY_GPU_MEMORY_SHARE`` overrides it)."""
     import torch
 
+    share, reserve = GPU_MEMORY.get(setting, GPU_MEMORY["balanced"])
+    MIN_RESERVE_GB.update(reserve)
     if torch.cuda.is_available():
-        share = float(os.environ.get("TDPLAY_GPU_MEMORY_SHARE") or GPU_MEMORY_SHARE)
+        share = float(os.environ.get("TDPLAY_GPU_MEMORY_SHARE") or share)
         torch.cuda.set_per_process_memory_fraction(min(max(share, 0.1), 1.0))
 
 
@@ -432,7 +439,7 @@ def render(job: dict) -> None:
 
     read_weights_without_mapping()
     stream_without_scale_keys()
-    limit_gpu_memory()
+    limit_gpu_memory(job.get("gpu_memory", "balanced"))
     keep_blocks_on_gpu()
     out_dir = Path(job["chunks_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)

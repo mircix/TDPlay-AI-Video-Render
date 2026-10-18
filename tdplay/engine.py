@@ -92,6 +92,8 @@ class Settings:
     #: ("disk": stream from disk, ~5 GB RAM; "cpu": keep in RAM, ~36 GB RAM).
     upsampler: str | None = None
     offload: str = "disk"
+    #: torch backend: how much of the graphics card the model may use ("balanced" or "max").
+    gpu_memory: str = "balanced"
     fps: int = FPS
 
 

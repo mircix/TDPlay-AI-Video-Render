@@ -98,6 +98,14 @@ def save_pref(key: str, value) -> None:
 def theme_pref() -> str:
     mode = load_prefs().get("theme", "system")
     return mode if mode in {v for _, v in THEMES} else "system"
+
+
+GPU_MEMORY_CHOICES = [("Balanced (80%)", "balanced"), ("Maximum (90%)", "max")]
+
+
+def gpu_memory_pref() -> str:
+    setting = load_prefs().get("gpu_memory", "balanced")
+    return setting if setting in {v for _, v in GPU_MEMORY_CHOICES} else "balanced"
 _lock = threading.Lock()
 
 
@@ -207,6 +215,9 @@ def _start(project: engine.Project, job: list[str], resume_hint: bool = True):
             yield (status_html("Already working on another video — wait for it to finish or press Stop.",
                                tone="warn", detail=Path(busy).name), gr.skip(), gr.skip())
             return
+        if not ON_MAC:  # the card's memory setting applies to whatever runs next, a resumed render too
+            project.settings.gpu_memory = gpu_memory_pref()
+            project.save()
         proc = worker.start(project.dir, job)
         _state["job"], _state["last_project"] = (str(project.dir), proc), str(project.dir)
     yield from _watch(str(project.dir), proc, resume_hint)
@@ -519,6 +530,12 @@ def build() -> gr.Blocks:
                                 info=("Streams the model from disk: ~5% slower, needs far less memory." if ON_MAC else
                                       "Streams the model from disk (~5 GB RAM). Off keeps it in RAM: faster, but "
                                       "needs about 36 GB free."))
+                            gpu_memory = gr.Radio(
+                                GPU_MEMORY_CHOICES, value=gpu_memory_pref(), label="Graphics card memory",
+                                visible=not ON_MAC,
+                                info="How much of the card the model may use. Maximum is faster; close games "
+                                     "and other GPU-heavy apps while it renders. Back to Balanced if the "
+                                     "screen flickers or goes black.")
                             fast_math = gr.Checkbox(True, label="Faster math (float16)", visible=ON_MAC,
                                                     info="About 20% faster. Turn off if you see glitches.")
                             watchdog = gr.Checkbox(False, label="GPU watchdog workaround (macOS 26)", visible=ON_MAC,
@@ -650,6 +667,9 @@ def build() -> gr.Blocks:
                          api_visibility="private", queue=False)
         demo.load(theme_pref, None, appearance, api_visibility="private", queue=False).then(
             None, appearance, None, js=APPLY_THEME_JS)
+        gpu_memory.input(lambda setting: save_pref("gpu_memory", setting), gpu_memory, None,
+                         api_visibility="private", queue=False)
+        demo.load(gpu_memory_pref, None, gpu_memory, api_visibility="private", queue=False)
     return demo
 
 
