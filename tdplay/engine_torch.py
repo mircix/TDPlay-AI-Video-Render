@@ -82,7 +82,7 @@ class TorchRunner(Runner):
         return {
             "chunks_dir": str(p.path("chunks")),
             "fps": s.fps, "width": s.width, "height": s.height, "seed": p.seeds[0],
-            "prompts": [seg.prompt.strip() for seg in p.segments],
+            "prompts": [p.prompt(i) for i in range(len(p.segments))],
             "first_frames": first, "new_frames": new, "images": images,
             "start_tail": str(tail) if tail else None,
             "start_tail_audio": bool(tail and np.abs(media.read_audio(tail)).max(initial=0.0) > SILENCE),

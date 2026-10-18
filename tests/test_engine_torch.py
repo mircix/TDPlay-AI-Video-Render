@@ -37,6 +37,9 @@ def test_job_has_one_prompt_and_length_per_segment(tmp_path):
         [Segment("a", 3), Segment("b", 2), Segment("c", 4)], reference_image=reference(tmp_path))
     job = TorchRunner(project, FAKE).job()
     assert job["prompts"] == ["a", "b", "c"]
+    project.characters = "Mia: red coat"
+    assert TorchRunner(project, FAKE).job()["prompts"] == [f"{x}. Mia: red coat." for x in "abc"]
+    project.characters = ""
     assert (job["first_frames"], job["new_frames"]) == (73, [48, 96])
     assert job["checkpoint"].endswith("ltx-2.3-22b-distilled-fp8.safetensors")
     # the photo starts the shot, and re-anchors the last frame of each later segment

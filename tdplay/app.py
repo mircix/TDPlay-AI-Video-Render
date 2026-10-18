@@ -49,7 +49,8 @@ SCENE_HELP = """
 LTX-2 takes a picture only as the video's first frame, so this builds one: each character is cut out of their
 photo and placed on the location. *Left ↔ right* moves a character across, *Feet* sets where they stand (lower is
 nearer the camera), *Size* is their height in the frame. Full-body photos work best for people who stand in the
-scene. Then say in segment 1 who they are and what they do. The first build downloads the cut-out model (180 MB).
+scene. *Name and outfit* goes into the Characters box above, which reminds the model in every segment what everyone
+wears. The first build downloads the cut-out model (180 MB).
 """
 
 RAM_GB = models.system_ram_gb()
@@ -178,12 +179,14 @@ def build_scene(location, *rest):
     """Build the first frame from the location and characters; it replaces the picture above."""
     n = scene.MAX_CHARACTERS
     pictures, across, down, sizes = rest[:n], rest[n:2 * n], rest[2 * n:3 * n], rest[3 * n:4 * n]
-    quality, aspect = rest[4 * n:4 * n + 2]
+    notes, (quality, aspect) = rest[4 * n:5 * n], rest[5 * n:5 * n + 2]
     chosen = [i for i, picture in enumerate(pictures) if picture]
+    written = [" ".join(str(notes[i] or "").split()) for i in chosen if str(notes[i] or "").strip()]
+    characters = "\n".join(written) if written else gr.skip()  # the notes go into every segment's prompt
     try:
         if chosen and not _cutter:
             if not scene.cutout_model_path().exists():
-                yield gr.skip(), gr.skip(), "Downloading the cut-out model (180 MB, only once)…"
+                yield gr.skip(), gr.skip(), gr.skip(), "Downloading the cut-out model (180 MB, only once)…"
             _cutter.append(scene.Cutter())
         width, height = resolution(quality, aspect)
         placements = [scene.Placement(x=across[i] / 100, y=down[i] / 100, size=sizes[i] / 100) for i in chosen]
@@ -191,13 +194,14 @@ def build_scene(location, *rest):
                            models.HOME / "scenes", cutter=_cutter[0] if _cutter else None)
     except ImportError:
         fix = "the repair setup in the Start menu" if os.name == "nt" else "the app's setup again"
-        yield gr.skip(), gr.skip(), f"⚠️ The cut-out model needs ONNX Runtime, which isn't installed: run {fix}."
+        yield (gr.skip(), gr.skip(), gr.skip(),
+               f"⚠️ The cut-out model needs ONNX Runtime, which isn't installed: run {fix}.")
         return
     except (ValueError, RuntimeError, OSError) as exc:
-        yield gr.skip(), gr.skip(), f"⚠️ {exc}"
+        yield gr.skip(), gr.skip(), gr.skip(), f"⚠️ {exc}"
         return
-    yield (str(path), gr.skip() if ON_MAC else scene.SCENE_STRENGTH,
-           "Built: it's now the first frame above. Describe the characters and what they do in segment 1, "
+    yield (str(path), gr.skip() if ON_MAC else scene.SCENE_STRENGTH, characters,
+           "Built: it's now the first frame above. Say what the characters do in segment 1, "
            "or move them with the sliders and build again.")
 
 
@@ -309,7 +313,7 @@ def _watch(project_dir: str, proc=None, resume_hint: bool = True):
             video, changed, last_push = gr.skip(), False, now
 
 
-def generate(image, start_video, n, *rest):
+def generate(image, start_video, characters, n, *rest):
     prompts, seconds = rest[:MAX_SEGMENTS], rest[MAX_SEGMENTS : 2 * MAX_SEGMENTS]
     (preset_key, quality, aspect, low_ram, fast_math, watchdog, anchor, seam, color_lock, seed, out_size,
      up_quality, image_strength) = rest[2 * MAX_SEGMENTS :]
@@ -338,7 +342,7 @@ def generate(image, start_video, n, *rest):
     segments = [engine.Segment(str(p or ""), int(s)) for p, s in zip(prompts[:n], seconds[:n])]
     try:
         project = engine.create_project(PROJECTS_DIR, settings, segments, reference_image=image or None,
-                                        start_video=start_video or None)
+                                        start_video=start_video or None, characters=characters or "")
     except (ValueError, RuntimeError) as exc:
         yield status_html(str(exc), tone="error"), None, gr.skip()
         return
@@ -446,6 +450,8 @@ def show_project(project_dir):
     head = (f"**{p.title}**\n\nStatus: {project_status(p)} · {p.done} of {len(p.segments)} segments · "
             f"{p.settings.width}×{p.settings.height} · seed {p.settings.seed}\n")
     lines = [head] + [f"{i + 1}. ({s.seconds} s) {s.prompt}" for i, s in enumerate(p.segments)]
+    if p.characters:
+        lines.append("\nCharacters (in every segment): " + "; ".join(p.characters.splitlines()))
     files = [f.name for f in (p.output, p.upscaled("1080p"), p.upscaled("4k")) if f.exists()]
     if files:
         lines.append("\nFiles: " + ", ".join(f"`{f}`" for f in files))
@@ -545,6 +551,12 @@ def build() -> gr.Blocks:
                     with gr.Column(scale=5):
                         image = gr.Image(label="Character / first frame (optional)", type="filepath",
                                          sources=["upload", "clipboard"], height=240)
+                        characters = gr.Textbox(
+                            label="Characters (added to every segment)", lines=2, max_lines=6,
+                            placeholder="Mia: black lace slip dress with thin straps, choker, long black hair\n"
+                                        "Leo: grey suit, white shirt, short brown hair",
+                            info="One line per character: name, clothes, hair. The model sees your photo only as "
+                                 "the first frame; these lines remind it in every segment, so outfits stay the same.")
                         with gr.Accordion("…or continue a video you already have", open=False):
                             start_video = gr.Video(label="Start video (any size; it is cropped to the shot size)",
                                                    sources=["upload"], height=200)
@@ -552,7 +564,7 @@ def build() -> gr.Blocks:
                             gr.Markdown(SCENE_HELP)
                             scene_location = gr.Image(label="Location (optional)", type="filepath",
                                                       sources=["upload", "clipboard"], height=180)
-                            scene_pictures, scene_across, scene_down, scene_size = [], [], [], []
+                            scene_pictures, scene_across, scene_down, scene_size, scene_notes = [], [], [], [], []
                             with gr.Row():
                                 for i in range(scene.MAX_CHARACTERS):
                                     with gr.Column(min_width=150):
@@ -565,6 +577,9 @@ def build() -> gr.Blocks:
                                         scene_down.append(gr.Slider(20, 100, value=95, step=1,
                                                                     label="Feet: up ↔ down"))
                                         scene_size.append(gr.Slider(10, 100, value=70, step=1, label="Size"))
+                                        scene_notes.append(gr.Textbox(
+                                            label="Name and outfit", lines=2, max_lines=4,
+                                            placeholder="Mia: black lace slip dress, thin straps, choker"))
                             scene_btn = gr.Button("Build the first frame")
                             scene_status = gr.Markdown()
                         gr.Markdown(TIPS)
@@ -706,14 +721,14 @@ def build() -> gr.Blocks:
         # windows can follow at once (concurrency_limit=None). Starting is guarded by active_job().
         follow = dict(api_visibility="private", show_progress="hidden", concurrency_limit=None)
         go.click(generate,
-                 [image, start_video, n_segments, *prompts, *seconds, preset, quality, aspect, low_ram, fast_math,
-                  watchdog, anchor, seam, color_lock, seed, out_size, up_quality, image_strength],
+                 [image, start_video, characters, n_segments, *prompts, *seconds, preset, quality, aspect, low_ram,
+                  fast_math, watchdog, anchor, seam, color_lock, seed, out_size, up_quality, image_strength],
                  outputs, **follow)
         for picture in scene_pictures:
             picture.change(spread_characters, scene_pictures, scene_across, api_visibility="private", queue=False)
         scene_btn.click(build_scene, [scene_location, *scene_pictures, *scene_across, *scene_down, *scene_size,
-                                      quality, aspect], [image, image_strength, scene_status],
-                        api_visibility="private")
+                                      *scene_notes, quality, aspect],
+                        [image, image_strength, characters, scene_status], api_visibility="private")
         stop_btn.click(stop, None, status, api_visibility="private", queue=False)
         resume_btn.click(resume_last, [low_ram, fast_math, watchdog], outputs, **follow)
         demo.load(attach, None, outputs, **follow)

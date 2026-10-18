@@ -225,3 +225,24 @@ def test_download_plans_skip_unused_weights():
     assert {"transformer-distilled.safetensors", "text_encoder.safetensors", "tokenizer.json"} <= names
     assert "transformer-dev.safetensors" not in names
     assert sum(size for _, size in files) < 50e9
+
+
+def test_character_notes_reach_every_segment(tmp_path):
+    notes = "Mia: black lace slip dress, thin straps\n\n  Leo: grey suit.  "
+    project = engine.create_project(tmp_path, make_settings(), [Segment("she walks in", 2), Segment("they talk!", 1)],
+                                    characters=notes)
+    assert project.characters == "Mia: black lace slip dress, thin straps\n\n  Leo: grey suit."
+    assert project.prompt(0) == "she walks in. Mia: black lace slip dress, thin straps. Leo: grey suit."
+    assert project.prompt(1) == "they talk! Mia: black lace slip dress, thin straps. Leo: grey suit."
+    events = run(project)
+    assert events[-1].kind == "done", events[-1].text
+    log = (project.dir / "log.txt").read_text(encoding="utf-8")
+    assert log.count("Mia: black lace slip dress, thin straps. Leo: grey suit.") >= 2  # one model run per segment
+    # The prompts as written are kept; projects from before the notes still open.
+    loaded = engine.Project.load(project.dir)
+    assert loaded.segments[0].prompt == "she walks in" and loaded.characters == project.characters
+    data = (project.dir / "project.json").read_text(encoding="utf-8").replace('"characters"', '"unused_key"')
+    (project.dir / "project.json").write_text(data.replace(',\n  "unused_key": "Mia: black lace slip dress, thin '
+                                                          'straps\\n\\n  Leo: grey suit."', ""), encoding="utf-8")
+    old = engine.Project.load(project.dir)
+    assert old.characters == "" and old.prompt(0) == "she walks in"

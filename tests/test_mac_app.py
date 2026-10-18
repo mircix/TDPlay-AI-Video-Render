@@ -107,12 +107,14 @@ def test_scene_builder_makes_the_first_frame(tmp_path, monkeypatch):
     updates = app.spread_characters(None, first, second)
     assert [u.get("value") for u in updates] == [None, 33, 67]
 
-    picture, strength, note = list(app.build_scene(None, None, first, second, 25, 33, 67, 95, 95, 95, 70, 70, 70,
-                                                   "576p", "16:9 landscape"))[-1]
+    picture, strength, characters, note = list(app.build_scene(
+        None, None, first, second, 25, 33, 67, 95, 95, 95, 70, 70, 70,
+        "not used: slot 1 has no picture", "Mia: lace dress", " Leo:  grey\n suit ", "576p", "16:9 landscape"))[-1]
     assert Path(picture).parent == tmp_path / "scenes" and "first frame above" in note
+    assert characters == "Mia: lace dress\nLeo: grey suit"  # one line each, into the Characters box
     assert strength == 0.85  # so the model may repaint the pasted-in light a little
     with Image.open(picture) as built:
         assert built.size == (1920, 1080)
-    *_, (_, _, note) = app.build_scene(None, None, None, None, 25, 50, 75, 95, 95, 95, 70, 70, 70, "576p",
-                                       "16:9 landscape")
+    *_, (_, _, _, note) = app.build_scene(None, None, None, None, 25, 50, 75, 95, 95, 95, 70, 70, 70, "", "", "",
+                                          "576p", "16:9 landscape")
     assert note.startswith("⚠️ Add a location picture")

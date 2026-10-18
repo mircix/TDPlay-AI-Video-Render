@@ -159,6 +159,8 @@ class Project:
     seeds: list[int]
     reference_image: str | None = None
     start_video: str | None = None
+    #: Who is in the shot and what they wear, one line per character: added to every segment's prompt.
+    characters: str = ""
     #: Segments finished so far.
     done: int = 0
     #: Chunk files that make up the shot so far (the carry tail is not one of them).
@@ -189,6 +191,18 @@ class Project:
 
     def path(self, *parts: str) -> Path:
         return self.dir.joinpath(*parts)
+
+    def prompt(self, i: int) -> str:
+        """Segment ``i``'s prompt for the model: the user's text, then the character notes.
+
+        LTX-2 sees a character photo only as the first frame; after that it knows only the prompt and
+        the end of the previous segment. Repeating who wears what in every segment keeps the outfits.
+        """
+        text = self.segments[i].prompt.strip()
+        notes = [line.strip() for line in self.characters.splitlines() if line.strip()]
+        if not notes:
+            return text
+        return " ".join(part if part.endswith((".", "!", "?", '"')) else part + "." for part in [text, *notes])
 
     def chunk(self, index: int, ext: str) -> Path:
         return self.path("chunks", f"chunk_{index:03d}.{ext}")
@@ -237,6 +251,7 @@ def create_project(
     *,
     reference_image: str | None = None,
     start_video: str | None = None,
+    characters: str = "",
 ) -> Project:
     """Make a new project folder under ``root`` (copies the inputs in, so the project is self-contained)."""
     if not segments:
@@ -265,6 +280,7 @@ def create_project(
         settings=settings,
         segments=segments,
         seeds=[base + i for i in range(len(segments))],
+        characters=characters.strip(),
     )
     if reference_image:
         from PIL import Image, ImageOps
@@ -466,7 +482,7 @@ class Runner:
     def _common_args(self, i: int, raw: Path) -> list[str]:
         s = self.project.settings
         # "--prompt=..." so a prompt that starts with "-" is not taken for an option.
-        args = ["--distilled", f"--prompt={self.project.segments[i].prompt.strip()}", "--output", str(raw),
+        args = ["--distilled", f"--prompt={self.project.prompt(i)}", "--output", str(raw),
                 "--model", s.model_dir, "--seed", str(self.project.seeds[i])]
         if s.gemma_dir:
             args += ["--gemma", s.gemma_dir]

@@ -63,6 +63,8 @@ being made keeps going.
    Or open *"…or continue a video you already have"* to extend one of your own clips, or *"…or build it from a
    location and characters"* to put up to three people in a place (see below).
 2. Pick the number of **segments** and write **one prompt per segment**, each with a length in seconds.
+   *(Optional)* In **Characters**, write one line per person: name, clothes, hair. Those lines are added to every
+   segment's prompt, so outfits stay the same all the way through.
 3. Press **Generate**. The shot so far appears after every segment, so you can watch it grow.
 4. The finished `render.mp4` is in the project folder (**Open project folder**).
 
@@ -78,7 +80,8 @@ to three **character** photos; each character is cut out of their photo (ISNet, 
 downloaded once: 180 MB) and placed on the location, taking on a little of its light. Move them with **Left ↔ right**,
 **Feet** (lower is nearer the camera) and **Size**, then press **Build the first frame**: the result replaces the
 first-frame photo, and you can build again until it looks right. Full-body photos work best for people who stand in
-the scene. Name the characters and say what they do in segment 1.
+the scene. Write each one's name and outfit under their photo: building the scene puts those lines into
+**Characters**, which reminds the model in every segment what everyone wears. Then say in segment 1 what they do.
 
 A pasted-in person can still look pasted in. On Windows, building a scene also sets **First frame strength**
 (Settings) to 0.85, so the model repaints the first frame a little and blends the light; 1 keeps it exactly as built.
