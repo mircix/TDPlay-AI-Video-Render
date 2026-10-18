@@ -18,8 +18,10 @@ the decoded pieces as ``chunks/piece_NNN.mp4`` + ``.wav`` into the project folde
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Iterator
+from contextvars import ContextVar
 from pathlib import Path
 
 #: Pixel frames carried from one chunk into the next (upstream ``ChunkConfig.next_video_carry_frames``).
@@ -110,10 +112,12 @@ def _pipeline_class():
                                          self._video_conditionings(ctx.images, ctx.num_frames, None))
             stage_1 = D.DISTILLED_SIGMAS.to(dtype=torch.float32, device=self.device)
             stage_2 = D.STAGE_2_DISTILLED_SIGMAS.to(dtype=torch.float32, device=self.device)
-            base = D.denoise_chunks(chunks, self.stage, sigmas=stage_1, noiser=ctx.noiser, fps=frame_rate,
-                                    noise_scale=1.0, **self._sampler_kwargs(seed, D.ANCESTRAL_NOISE_SEED_OFFSET))
+            base = D.denoise_chunks(chunks, GpuPass(self.stage, "draft"), sigmas=stage_1, noiser=ctx.noiser,
+                                    fps=frame_rate, noise_scale=1.0,
+                                    **self._sampler_kwargs(seed, D.ANCESTRAL_NOISE_SEED_OFFSET))
             upscaled = D.spatially_upsample_chunks(base, self.upsampler)
-            refined = D.denoise_chunks(upscaled, self.stage, sigmas=stage_2, noiser=ctx.noiser, fps=frame_rate,
+            refined = D.denoise_chunks(upscaled, GpuPass(self.stage, "refine"), sigmas=stage_2, noiser=ctx.noiser,
+                                       fps=frame_rate,
                                        **self._sampler_kwargs(seed, D.ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET))
             decoded = D.decode_chunks(refined, self.video_decoder, self.audio_decoder, fps=frame_rate,
                                       tiling_config=ctx.tiling_config, generator=ctx.generator, dtype=ctx.vae_dtype)
@@ -197,6 +201,179 @@ def stream_without_scale_keys() -> None:
     builder._scan_checkpoint_keys = scan_without_scales
 
 
+# -- Keeping part of the transformer on the GPU -----------------------------------------------------------
+#
+# LTX-2 streams the transformer's 48 blocks through 2 GPU slots, evicting the oldest. Every denoising step
+# runs the blocks in order, so with Low-RAM mode each step reads the whole transformer from disk again while
+# most of the GPU's memory sits unused. These patches keep as many blocks as fit on the GPU for a whole pass
+# and stream only the rest. The pass's working memory (activations) must still fit: before a pass kind has
+# run, a cautious reserve is left free; after it has run, its measured peak (per latent token) is used.
+
+#: GPU memory kept free for a pass's working memory before that kind of pass has been measured.
+FIRST_RESERVE_GB = {"draft": 6.0, "refine": 10.0}
+#: Blocks that keep streaming through the GPU besides the resident ones (LTX-2's own default).
+STREAMING_SLOTS = 2
+
+_pass: ContextVar[tuple[str, int]] = ContextVar("tdplay_gpu_pass", default=("refine", 0))
+#: Peak working memory per latent token, measured per pass kind ("draft": half resolution, "refine": full).
+_working_bytes_per_token: dict[str, float] = {}
+
+
+class GpuPass:
+    """LTX-2's denoising stage, labelled with its pass ("draft" or "refine") and size while it runs."""
+
+    def __init__(self, stage, kind: str):
+        self._stage, self._kind = stage, kind
+
+    def __call__(self, *args, **kwargs):
+        video = kwargs["modalities"].video
+        tokens = video.latent.numel() // video.latent.shape[1] if video is not None else 0
+        token = _pass.set((self._kind, tokens))
+        try:
+            return self._stage(*args, **kwargs)
+        finally:
+            _pass.reset(token)
+
+    def __getattr__(self, name):
+        return getattr(self._stage, name)
+
+
+def gpu_reserve(kind: str, tokens: int) -> int:
+    """Bytes of GPU memory to keep free for a pass's working memory."""
+    if os.environ.get("TDPLAY_GPU_RESERVE_GB"):
+        return int(float(os.environ["TDPLAY_GPU_RESERVE_GB"]) * 2**30)
+    per_token = _working_bytes_per_token.get(kind)
+    if per_token and tokens:
+        return int(per_token * tokens * 1.25) + 2**30  # measured, plus a quarter and 1 GB for the allocator
+    return int(FIRST_RESERVE_GB[kind] * 2**30)
+
+
+def resident_block_count(available: int, slot_nbytes: int, blocks: int, reserve: int) -> int:
+    """How many blocks fit on the GPU next to the streaming slots and the reserve."""
+    spare = available - reserve - STREAMING_SLOTS * slot_nbytes
+    return max(0, min(blocks, int(spare // slot_nbytes))) if slot_nbytes > 0 else 0
+
+
+def _provider_get(self, idx: int):
+    """``WeightsProvider.get``, except that resident blocks are never evicted from the GPU."""
+    from ltx_core.block_streaming.provider import CachedBlock
+    from ltx_core.block_streaming.utils import carve_buffer, layout_nbytes
+
+    if idx in self._cache:
+        return self._cache[idx].views
+    if len(self._cache) >= self._pool.capacity:
+        resident = getattr(self, "tdplay_resident", frozenset())
+        victim = next((i for i in self._cache if i not in resident), next(iter(self._cache)))
+        evicted = self._cache.pop(victim)
+        self._pool.release(evicted.raw, event=self._events.pop(victim, None))
+    layout = self._source.block_layout(idx)
+    raw = self._pool.acquire()
+    gpu_weights = carve_buffer(raw, layout)
+    cpu_buffer = self._source.get(idx)
+    h2d_event = self._copy_to_gpu(idx, raw, gpu_weights, cpu_buffer, layout_nbytes(layout))
+    self._source.release(idx, event=h2d_event)
+    self._cache[idx] = CachedBlock(raw, gpu_weights)
+    return gpu_weights
+
+
+def _disk_source_get(self, idx: int):
+    """``DiskWeightSource.get``, except that it reads ahead only blocks that aren't resident on the GPU.
+
+    Read-ahead of a resident block would hold a CPU buffer that is never collected.
+    """
+    if idx in self._in_flight:
+        raise RuntimeError(f"Block {idx} is already in flight; release it before getting it again")
+    scheduled = self._scheduled.pop(idx, None)
+    if scheduled is None:
+        scheduled = self._schedule(idx)
+    error = scheduled.status.wait()
+    if error is not None:
+        self._pool.release(scheduled.raw)
+        raise error
+    self._in_flight[idx] = scheduled.raw
+    resident = getattr(self, "tdplay_resident", frozenset())
+    ahead = [j for k in range(1, self._blocks_number) if (j := (idx + k) % self._blocks_number) not in resident]
+    for j in ahead[: self._prefetch_depth]:
+        self._ensure_scheduled(j)
+    return scheduled.raw
+
+
+def keep_blocks_on_gpu() -> None:
+    """Keep as many transformer blocks on the GPU as fit, for each pass; stream only the rest."""
+    if os.environ.get("TDPLAY_GPU_RESIDENT") == "0":
+        return
+    import torch
+    from ltx_core.block_streaming import builder, provider, source
+
+    if getattr(builder.StreamingModelBuilder.build, "tdplay", False):
+        return
+    provider.WeightsProvider.get = _provider_get
+    source.DiskWeightSource.get = _disk_source_get
+    original_build = builder.StreamingModelBuilder.build
+
+    def build(self, device=None, dtype=None, cpu_slots_count=None, gpu_slots_count=None, **kwargs):
+        device = torch.device(device) if device is not None else torch.device("cuda")
+        if self.blocks_prefix != "transformer_blocks" or gpu_slots_count is not None or device.type != "cuda":
+            return original_build(self, device=device, dtype=dtype, cpu_slots_count=cpu_slots_count,
+                                  gpu_slots_count=gpu_slots_count, **kwargs)
+        kind, tokens = _pass.get()
+        plan = {"resident": 0, "slot": 0, "blocks": 0}
+        resolve_attr, buffer_pool = builder.resolve_attr, builder.BufferPool
+
+        def counting_resolve_attr(obj, attr):
+            found = resolve_attr(obj, attr)
+            plan["blocks"] = len(found)
+            return found
+
+        def gpu_pool(slot_nbytes, capacity, pool_device, **pool_kwargs):
+            if torch.device(pool_device).type != "cuda":
+                return buffer_pool(slot_nbytes, capacity, pool_device, **pool_kwargs)
+            try:
+                free, _total = torch.cuda.mem_get_info(pool_device)
+                available = free + torch.cuda.memory_reserved(pool_device) - torch.cuda.memory_allocated(pool_device)
+            except RuntimeError:  # the driver can't say: stream everything, as LTX-2 does
+                available = 0
+            resident = resident_block_count(available, slot_nbytes, plan["blocks"], gpu_reserve(kind, tokens))
+            while True:  # if the GPU can't give one buffer that large after all, keep fewer blocks
+                try:
+                    pool = buffer_pool(slot_nbytes, max(resident + capacity * (resident < plan["blocks"]), 1),
+                                       pool_device, **pool_kwargs)
+                    break
+                except torch.OutOfMemoryError:
+                    if resident == 0:
+                        raise
+                    resident //= 2
+            plan.update(resident=resident, slot=slot_nbytes)
+            return pool
+
+        builder.resolve_attr, builder.BufferPool = counting_resolve_attr, gpu_pool
+        try:
+            wrapper = original_build(self, device=device, dtype=dtype, cpu_slots_count=cpu_slots_count, **kwargs)
+        finally:
+            builder.resolve_attr, builder.BufferPool = resolve_attr, buffer_pool
+        resident = frozenset(range(plan["resident"]))
+        wrapper._provider.tdplay_resident = resident
+        wrapper._provider._source.tdplay_resident = resident
+        print(f"GPU: keeping {len(resident)} of {plan['blocks']} transformer blocks on the card "
+              f"({len(resident) * plan['slot'] / 2**30:.1f} GB) for the {kind} pass", flush=True)
+
+        torch.cuda.reset_peak_memory_stats(device)
+        weights = torch.cuda.memory_allocated(device)
+        teardown = wrapper.teardown
+
+        def teardown_and_measure():
+            if tokens:
+                working = max(0, torch.cuda.max_memory_allocated(device) - weights)
+                _working_bytes_per_token[kind] = max(working / tokens, _working_bytes_per_token.get(kind, 0.0))
+            teardown()
+
+        wrapper.teardown = teardown_and_measure
+        return wrapper
+
+    build.tdplay = True
+    builder.StreamingModelBuilder.build = build
+
+
 def render(job: dict) -> None:
     import torch
     from ltx_core.quantization.fp8_cast import build_policy
@@ -207,6 +384,7 @@ def render(job: dict) -> None:
 
     read_weights_without_mapping()
     stream_without_scale_keys()
+    keep_blocks_on_gpu()
     out_dir = Path(job["chunks_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     fps = int(job["fps"])

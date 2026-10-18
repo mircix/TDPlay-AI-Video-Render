@@ -147,3 +147,141 @@ def test_lightricks_fp8_checkpoint_streams_from_disk(tmp_path, monkeypatch):
     DiskBlockReader(DiskTensorReader([path]), blocks, sd_ops, "transformer_blocks").read_into(target, 1)
     for value in target.values():
         assert torch.equal(value.float(), w)
+
+
+def test_resident_blocks_fit_next_to_the_reserve():
+    from tdplay.ltx_torch import FIRST_RESERVE_GB, STREAMING_SLOTS, gpu_reserve, resident_block_count
+
+    gb = 2**30
+    # A 24 GB card with ~18.5 GB free after the transformer's other weights; 0.39 GB blocks.
+    slot = int(0.39 * gb)
+    draft = resident_block_count(int(18.5 * gb), slot, 48, gpu_reserve("draft", 0))
+    refine = resident_block_count(int(18.5 * gb), slot, 48, gpu_reserve("refine", 0))
+    assert 25 <= draft <= 35 and 15 <= refine < draft
+    assert resident_block_count(int(80 * gb), slot, 48, 0) == 48  # never more than the model has
+    assert resident_block_count(int(3 * gb), slot, 48, int(FIRST_RESERVE_GB["draft"] * gb)) == 0
+    assert STREAMING_SLOTS == 2
+
+
+def test_streaming_keeps_resident_blocks_on_the_gpu(tmp_path, monkeypatch):
+    """LTX-2's own streaming classes on the CPU: resident blocks are read once, the rest every pass."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("ltx_core")
+    from ltx_core.block_streaming import builder, provider, source
+    from ltx_core.block_streaming.block_fetcher import BlockFetcher
+    from ltx_core.block_streaming.disk import DiskBlockReader, DiskTensorReader
+    from ltx_core.block_streaming.pool import BufferPool
+    from ltx_core.block_streaming.stream_sync import create_stream_sync
+    from ltx_core.block_streaming.wrapper import BlockStreamingWrapper
+    from ltx_core.loader.sd_ops import SDOps
+    from safetensors.torch import save_file
+
+    from tdplay import ltx_torch
+
+    for cls, name in ((provider.WeightsProvider, "get"), (source.DiskWeightSource, "get"),
+                      (builder.StreamingModelBuilder, "build")):
+        monkeypatch.setattr(cls, name, getattr(cls, name))  # undone after the test
+    ltx_torch.keep_blocks_on_gpu()
+
+    n, resident = 6, frozenset({0, 1, 2})
+    weights = [torch.randn(4, 4) for _ in range(n)]
+    path = str(tmp_path / "blocks.safetensors")
+    save_file({f"transformer_blocks.{i}.weight": w for i, w in enumerate(weights)}, path)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer_blocks = torch.nn.ModuleList(torch.nn.Linear(4, 4, bias=False) for _ in range(n))
+
+        def forward(self, x):
+            for block in self.transformer_blocks:
+                x = block(x)
+            return x
+
+    with torch.device("meta"):
+        model = Model()
+    blocks = model.transformer_blocks
+    key_map, _ = builder._scan_checkpoint_keys([path], SDOps("all").with_matching(), "transformer_blocks")
+    layouts = builder._block_layouts(blocks, key_map, torch.float32)
+    reads = []
+
+    class CountingReader(DiskTensorReader):
+        def get_tensor(self, key):
+            reads.append(int(key.split(".")[1]))
+            return super().get_tensor(key)
+
+    cpu, sync = torch.device("cpu"), create_stream_sync(torch.device("cpu"))
+    slot = max(sum(t.numel() * 4 for t in model.transformer_blocks[0].parameters()), 64)
+    disk = source.DiskWeightSource(
+        BufferPool(slot, 2 + 2, cpu, reuse_barrier=sync.reuse_barrier),
+        BlockFetcher(DiskBlockReader(CountingReader([path]), key_map, None, "transformer_blocks")),
+        layouts, blocks_number=n, prefetch_depth=2)
+    gpu = provider.WeightsProvider(BufferPool(slot, len(resident) + 2, cpu, reuse_barrier=sync.reuse_barrier),
+                                   sync, cpu, disk)
+    gpu.tdplay_resident = disk.tdplay_resident = resident
+    wrapper = BlockStreamingWrapper(model, blocks, gpu, cpu)
+
+    x = torch.randn(3, 4)
+    expected = x
+    for w in weights:
+        expected = expected @ w.T
+    with torch.inference_mode():
+        for _ in range(3):
+            assert torch.allclose(wrapper(x), expected, atol=1e-5)
+    wrapper.teardown()
+    counts = [reads.count(i) for i in range(n)]
+    # Resident blocks are read from disk once; streamed ones once per pass, and the read-ahead after the
+    # last block wraps around to the next streamed ones (3 and 4), as LTX-2's own read-ahead does.
+    assert counts == [1, 1, 1, 4, 4, 3], counts
+
+
+def test_resident_block_count_learns_from_the_measured_pass(monkeypatch, capsys):
+    """The build glue: sizes the GPU pool from free memory, then uses the pass's measured peak."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("ltx_core")
+    from types import SimpleNamespace
+
+    from ltx_core.block_streaming import builder, provider, source
+
+    from tdplay import ltx_torch
+
+    gb = 2**30
+    for cls, name in ((provider.WeightsProvider, "get"), (source.DiskWeightSource, "get"),
+                      (builder.StreamingModelBuilder, "build")):
+        monkeypatch.setattr(cls, name, getattr(cls, name))
+    monkeypatch.setattr(ltx_torch, "_working_bytes_per_token", {})
+    pools = []
+
+    class Pool:  # stands in for a GPU buffer pool
+        def __init__(self, slot_nbytes, capacity, device, **kwargs):
+            pools.append(capacity)
+
+    def fake_build(self, device=None, dtype=None, cpu_slots_count=None, gpu_slots_count=None, **kwargs):
+        model = SimpleNamespace(blocks=torch.nn.ModuleList(torch.nn.Identity() for _ in range(48)))
+        blocks = builder.resolve_attr(model, "blocks")
+        builder.BufferPool(int(0.39 * gb), 2, device)
+        assert len(blocks) == 48
+        return SimpleNamespace(_provider=SimpleNamespace(_source=SimpleNamespace()), teardown=lambda: None)
+
+    monkeypatch.setattr(builder.StreamingModelBuilder, "build", fake_build)
+    monkeypatch.setattr(builder, "BufferPool", Pool)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (int(18.5 * gb), 24 * gb))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device=None: 0)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 6 * gb)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device=None: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device=None: 8 * gb)  # 2 GB working memory
+    ltx_torch.keep_blocks_on_gpu()
+    model = SimpleNamespace(blocks_prefix="transformer_blocks")
+
+    stage = ltx_torch.GpuPass(lambda **kwargs: builder.StreamingModelBuilder.build(model, device="cuda"), "draft")
+    latent = torch.zeros(1, 128, 7, 9, 16)  # 1008 latent tokens
+    first = stage(modalities=SimpleNamespace(video=SimpleNamespace(latent=latent)))
+    first.teardown()
+    second = stage(modalities=SimpleNamespace(video=SimpleNamespace(latent=latent)))
+    resident_first = len(first._provider.tdplay_resident)
+    resident_second = len(second._provider.tdplay_resident)
+    assert pools == [resident_first + 2, resident_second + 2]
+    provider = first._provider
+    assert provider._source.tdplay_resident == provider.tdplay_resident == frozenset(range(resident_first))
+    assert 0 < resident_first < resident_second <= 48  # 6 GB first reserve, then the measured 2 GB (+25%, +1 GB)
+    assert f"keeping {resident_first} of 48 transformer blocks" in capsys.readouterr().out

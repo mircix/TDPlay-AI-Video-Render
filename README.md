@@ -165,7 +165,9 @@ OneDrive-synced folder) and double-click **`install.bat`**. It does the same set
 
 The app picks these for you: **LTX-2.3 distilled, 8-bit** (official Lightricks weights, ≈ 55 GB with the Gemma 3
 text encoder), **576p**, segments **up to 5 s**. With less than 48 GB of RAM, *Low-RAM mode* is on: the model's
-weights stream from the SSD instead of being held in memory, which is what makes 32 GB of RAM work. 704p
+weights stream from the SSD instead of being held in memory, which is what makes 32 GB of RAM work. As much of the model
+as fits stays on the graphics card for the whole render, and only the rest streams from the SSD: the log says
+how much ("GPU: keeping 30 of 48 transformer blocks on the card"). The more of it stays on the card, the faster. 704p
 (1280×704) is worth trying on a 24 GB card.
 
 ### How the Windows version differs

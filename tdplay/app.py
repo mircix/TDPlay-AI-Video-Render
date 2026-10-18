@@ -170,8 +170,15 @@ def _eta(started: float, fraction: float) -> str:
     return f"about {left / 60:.0f} min left" if left >= 90 else "less than 2 min left"
 
 
-def open_folder(path: str | None) -> None:
-    if path and Path(path).exists():
+def open_folder(path: str | None = None) -> None:
+    """Show a project's folder in Finder / File Explorer: ``path``, else the latest project, else all of them."""
+    path = path or _state["last_project"] or latest_project()
+    if not path or not Path(path).exists():
+        PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+        path = str(PROJECTS_DIR)
+    if os.name == "nt":
+        os.startfile(path)  # Windows has no "open" command
+    else:
         opener = "open" if sys.platform == "darwin" else "xdg-open"
         subprocess.Popen([opener, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -621,8 +628,7 @@ def build() -> gr.Blocks:
         stop_btn.click(stop, None, status, api_visibility="private", queue=False)
         resume_btn.click(resume_last, [low_ram, fast_math, watchdog], outputs, **follow)
         demo.load(attach, None, outputs, **follow)
-        folder_btn.click(lambda: open_folder(_state["last_project"] or str(PROJECTS_DIR)), None, None,
-                         api_visibility="private")
+        folder_btn.click(open_folder, None, None, api_visibility="private")
 
         refresh_btn.click(refresh_projects, None, project, api_visibility="private")
         project.change(show_project, project, [project_video, project_info], api_visibility="private")
