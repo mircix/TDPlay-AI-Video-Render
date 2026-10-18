@@ -150,11 +150,12 @@ the lower resolutions. 8–12 GB cards are likely too small.
    Python 3.13 (python.org's build), [uv](https://docs.astral.sh/uv/), ffmpeg, Lightricks' LTX-2 code, and **AMD's ROCm
    PyTorch for your card** (RX 7900 → `gfx1100`, RX 7800/7700 → `gfx1101`, RX 7600 → `gfx1102`, RX 9060 →
    `gfx1200`, RX 9070 / R9700 → `gfx1201`).
-   It then checks that PyTorch can see the GPU, and offers to download the model (about 55 GB). You can also do that
-   later in the app's **Models** tab. If something goes wrong, fix it and open **TDPlay AI Video Render - repair
-   setup** from the Start menu.
-3. Open **TDPlay AI Video Render** from the Start menu or the desktop. It opens in its own window, in dark or light
-   mode like Windows. Closing it doesn't stop a video that is being made.
+   It then checks that PyTorch can see the GPU. Keep that window open until it closes by itself. If it stops (or was
+   closed), open **TDPlay AI Video Render - repair setup** from the Start menu: it continues where it stopped, and
+   its log is `setup.log` in the install folder.
+3. Open **TDPlay AI Video Render** from the Start menu or the desktop and download the model (about 55 GB) in its
+   **Models** tab. It opens in its own window, in dark or light mode like Windows. Closing it doesn't stop a video
+   that is being made.
    * `start.bat` (in the install folder) opens the same app in your web browser, with a window showing the log.
 
 **From the source folder instead:** get the `TDPlay-AI-Video-Render` folder, keep it somewhere permanent (not in a

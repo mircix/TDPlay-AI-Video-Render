@@ -38,6 +38,9 @@ MinVersion=10.0.19041
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Messages]
+FinishedLabel=Setup has finished installing [name] on your computer.%n%nOpen it, then download the video model (about 55 GB) in its Models tab.
+
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
@@ -74,7 +77,7 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
-  Args: String;
+  Args, Reason: String;
 begin
   if CurStep <> ssPostInstall then
     Exit;
@@ -82,18 +85,22 @@ begin
           '" -FromInstaller ' + ExpandConstant('{param:setupargs|}');
   if WizardSilent then
     Args := Args + ' -SkipModel -NoPause';
-  WizardForm.StatusLabel.Caption := 'Setting up Python, PyTorch for your graphics card and LTX-2. ' +
-    'This downloads a few GB; the window that opened shows the progress.';
+  WizardForm.StatusLabel.Caption := 'Downloading Python, PyTorch and LTX-2 (several GB). Keep the setup window open.';
   WizardForm.ProgressGauge.Style := npbstMarquee;
   Log('Running install.ps1 ' + Args);
   SetupOk := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Args, ExpandConstant('{app}'),
                   SW_SHOW, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
   Log('install.ps1 exit code: ' + IntToStr(ResultCode));
   WizardForm.ProgressGauge.Style := npbstNormal;
-  if not SetupOk then
-    SuppressibleMsgBox('The setup did not finish (exit code ' + IntToStr(ResultCode) + ').' + #13#10#13#10 +
-      'Fix what the setup window said, then open "{#AppName} - repair setup" from the Start menu.',
-      mbError, MB_OK, IDOK);
+  if not SetupOk then begin
+    if ResultCode = -1073741510 then  { STATUS_CONTROL_C_EXIT: the window was closed, or Ctrl+C pressed }
+      Reason := 'The setup window was closed before it finished.'
+    else
+      Reason := 'The setup did not finish (exit code ' + IntToStr(ResultCode) + ').';
+    SuppressibleMsgBox(Reason + #13#10#13#10 +
+      'Open "{#AppName} - repair setup" from the Start menu: it continues where it stopped. ' +
+      'Its log is setup.log in ' + ExpandConstant('{app}') + '.', mbError, MB_OK, IDOK);
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

@@ -86,6 +86,8 @@ trap { Fail ("The setup stopped: " + $_.Exception.Message) }
 # the output of programs like pip here; the steps and any error are in it).
 Start-Transcript -Path (Join-Path $Root "setup.log") -Force | Out-Null
 Say "TDPlay AI Video Render setup"
+try { $Host.UI.RawUI.WindowTitle = "TDPlay AI Video Render setup - keep this window open" } catch { }
+Write-Host "Keep this window open: it closes by itself when the setup is done. The downloads take a while." -ForegroundColor Yellow
 Write-Host ("Options: " + (($PSBoundParameters.Keys | ForEach-Object { "-$_" }) -join " "))
 
 # --- This PC ------------------------------------------------------------------------------
@@ -241,7 +243,11 @@ if (-not $FromInstaller) {
 }
 
 # --- Model ---------------------------------------------------------------------------------------
-if (-not $SkipModel) {
+# From Setup.exe the window may be behind the installer, so don't wait for an answer there: the app's
+# Models tab downloads the model, with a progress bar.
+if ($FromInstaller -and -not $SkipModel) {
+    Say "Next: open the app and download the video model (about 55 GB) in its Models tab."
+} elseif (-not $SkipModel) {
     Say "Model download"
     Write-Host "TDPlay needs the LTX-2.3 model (about 55 GB). You can also do this later in the app's Models tab."
     $answer = Read-Host "Download it now? [Y/n]"
