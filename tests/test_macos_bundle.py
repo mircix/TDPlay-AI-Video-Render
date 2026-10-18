@@ -12,6 +12,8 @@ import pytest
 from tdplay import macos_bundle
 
 ROOT = Path(__file__).resolve().parent.parent
+#: The launchers show macOS alerts that wait for a click; the tests run without them.
+NO_DIALOGS = {"TDPLAY_NO_DIALOGS": "1"}
 
 
 def fake_install(tmp_path: Path) -> Path:
@@ -49,7 +51,7 @@ def test_launcher_is_bash32_safe_and_starts_the_app(tmp_path):
     bashes = ["bash"] + ([os.environ["TDPLAY_BASH32"]] if os.environ.get("TDPLAY_BASH32") else [])
     for bash in bashes:
         subprocess.run([bash, "-n", str(launcher)], check=True)
-        subprocess.run([bash, str(launcher)], check=True, env={"HOME": str(home), "PATH": os.environ["PATH"]})
+        subprocess.run([bash, str(launcher)], check=True, env={"HOME": str(home), "PATH": os.environ["PATH"], **NO_DIALOGS})
         cwd, *args = (home / "launched.txt").read_text().splitlines()
         assert Path(cwd) == root and args == ["-m", "tdplay.desktop_app"]
         assert "---" in (home / "TDPlay" / "logs" / "app.log").read_text()
@@ -60,7 +62,7 @@ def test_launcher_explains_a_moved_folder(tmp_path):
     app = macos_bundle.build(tmp_path / "Applications", root)
     shutil.rmtree(root / ".venv")
     result = subprocess.run(["bash", str(app / "Contents" / "MacOS" / "TDPlay")],
-                            env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]})
+                            env={"HOME": str(tmp_path), "PATH": os.environ["PATH"], **NO_DIALOGS})
     assert result.returncode == 1
 
 
@@ -115,7 +117,7 @@ def test_standalone_app_sets_itself_up_once_then_starts(tmp_path):
     for i, bash in enumerate(bashes):
         home = tmp_path / f"home{i}"
         home.mkdir()
-        env = {"HOME": str(home), "PATH": os.environ["PATH"]}
+        env = {"HOME": str(home), "PATH": os.environ["PATH"], **NO_DIALOGS}
         runtime = home / "TDPlay" / "runtime"
         for _ in range(2):  # the second launch goes straight to the app
             subprocess.run([bash, str(launcher)], check=True, env=env)
@@ -136,7 +138,7 @@ def test_standalone_app_reports_a_failed_setup(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     (home / "fail").touch()
-    env = {"HOME": str(home), "PATH": os.environ["PATH"]}
+    env = {"HOME": str(home), "PATH": os.environ["PATH"], **NO_DIALOGS}
     result = subprocess.run(["bash", str(app / "Contents" / "MacOS" / "TDPlay")], env=env)
     assert result.returncode == 1
     assert "ERROR: Could not download uv" in (home / "TDPlay" / "logs" / "setup.log").read_text()

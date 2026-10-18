@@ -42,7 +42,7 @@ if [[ -f "${{LOG_DIR}}/app.log" ]] && (( $(wc -c < "${{LOG_DIR}}/app.log") > 500
   mv -f "${{LOG_DIR}}/app.log" "${{LOG_DIR}}/app.log.1"
 fi
 if [[ ! -x "${{APP_HOME}}/.venv/bin/python" ]]; then
-  /usr/bin/osascript -e 'display alert "TDPlay AI Video Render" message "Its folder was moved or deleted. Open the TDPlay-AI-Video-Render folder and double-click install.command again."' >/dev/null 2>&1
+  [[ -n "${{TDPLAY_NO_DIALOGS:-}}" ]] || /usr/bin/osascript -e 'display alert "TDPlay AI Video Render" message "Its folder was moved or deleted. Open the TDPlay-AI-Video-Render folder and double-click install.command again."' >/dev/null 2>&1
   exit 1
 fi
 cd "${{APP_HOME}}" || exit 1
@@ -65,9 +65,12 @@ mkdir -p "${LOG_DIR}"
 rotate() {
   if [[ -f "${1}" ]] && (( $(wc -c < "${1}") > 5000000 )); then mv -f "${1}" "${1}.1"; fi
 }
-# Dialogs, except in TDPLAY_SETUP_ONLY mode (set up without starting the app; used by the tests).
+# Dialogs, except with TDPLAY_NO_DIALOGS or TDPLAY_SETUP_ONLY (set up without starting the app): the tests.
+dialogs() {
+  [[ -x /usr/bin/osascript && -z "${TDPLAY_NO_DIALOGS:-}" && -z "${TDPLAY_SETUP_ONLY:-}" ]]
+}
 osa() {
-  if [[ -x /usr/bin/osascript && -z "${TDPLAY_SETUP_ONLY:-}" ]]; then /usr/bin/osascript "$@" >/dev/null 2>&1; fi
+  if dialogs; then /usr/bin/osascript "$@" >/dev/null 2>&1; fi
 }
 
 want="$(cat "${RES}/app/VERSION")"
@@ -86,7 +89,7 @@ if [[ "${want}" != "${have}" || ! -x "${RUNTIME}/venv/bin/python" ]]; then
   echo "--- $(date): setting up ${want} ---" >> "${SETUP_LOG}"
   # A window while it works; it closes when the setup ends. "Show Details" opens the log.
   dialog=""
-  if [[ -x /usr/bin/osascript && -z "${TDPLAY_SETUP_ONLY:-}" ]]; then
+  if dialogs; then
     /usr/bin/osascript -e 'on run argv' -e 'activate' \
       -e 'set r to display dialog "Setting up TDPlay AI Video Render. The first time, this downloads about 1 GB and takes a few minutes. The app opens when it is ready." buttons {"Show Details", "OK"} default button "OK" with title "TDPlay AI Video Render" giving up after 3600' \
       -e 'if button returned of r is "Show Details" then do shell script "open -a Console " & quoted form of (item 1 of argv)' \
