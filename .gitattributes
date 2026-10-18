@@ -1,6 +1,7 @@
 # Windows scripts keep CRLF line endings (cmd.exe and PowerShell 5.1 expect them).
 *.bat text eol=crlf
 *.ps1 text eol=crlf
+windows/installer/* text eol=crlf
 *.icns binary
 *.ico binary
 *.png binary

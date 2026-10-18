@@ -126,7 +126,9 @@ def main() -> None:
     print(f"prompt: {args.prompt}", file=sys.stderr, flush=True)
     fail = os.environ.get("FAKE_LTX_FAIL_ON")
     if fail and fail in args.output:
-        os.kill(os.getpid(), signal.SIGKILL)
+        if hasattr(signal, "SIGKILL"):
+            os.kill(os.getpid(), signal.SIGKILL)
+        os._exit(137)  # Windows has no SIGKILL: exit with the code a killed process gets
 
     if args.command == "generate":
         assert (args.frames - 1) % 8 == 0, "frames must be on the 8k+1 grid"

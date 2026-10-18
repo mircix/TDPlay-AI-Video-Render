@@ -180,7 +180,7 @@ def _keep_awake() -> None:
         ctypes.windll.kernel32.SetThreadExecutionState(es_continuous | es_system_required)
     elif sys.platform == "darwin":
         try:
-            subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+            subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             pass
 

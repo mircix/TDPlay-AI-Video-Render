@@ -1,0 +1,164 @@
+# Builds the Mac disk image and the Windows installer, installs each one the way a user would, checks
+# that the installed app works (a short render with a stand-in model; the runners have no usable GPU
+# for the real one), and publishes both on a GitHub release when a v* tag is pushed. The installers go
+# straight onto a draft release (no workflow artifacts), which is published once both jobs passed.
+name: Installers
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:   # "Run workflow" on GitHub: build and test both installers without releasing
+
+permissions:
+  contents: write
+
+# A new push replaces a run that is still going (macOS minutes count ten times).
+concurrency:
+  group: installers-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  draft:
+    name: Draft the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --draft --verify-tag \
+            --title "TDPlay AI Video Render ${GITHUB_REF_NAME#v}" --notes-file .github/release-notes.md
+
+  macos:
+    name: Mac disk image
+    needs: [draft]
+    if: ${{ !cancelled() && needs.draft.result != 'failure' }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the disk image
+        run: bash macos/build_dmg.sh "${GITHUB_SHA::7}"
+
+      - name: Install from the disk image; the first launch sets the app up
+        run: |
+          set -euo pipefail
+          hdiutil attach dist/*.dmg -nobrowse -mountpoint /tmp/tdplay-dmg
+          ls -la /tmp/tdplay-dmg
+          mkdir -p "${HOME}/Applications"
+          ditto "/tmp/tdplay-dmg/TDPlay AI Video Render.app" "${HOME}/Applications/TDPlay AI Video Render.app"
+          hdiutil detach /tmp/tdplay-dmg
+          TDPLAY_SETUP_ONLY=1 "${HOME}/Applications/TDPlay AI Video Render.app/Contents/MacOS/TDPlay"
+          cat "${HOME}/TDPlay/logs/setup.log"
+
+      - name: Smoke test the installed app
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          "${HOME}/TDPlay/runtime/venv/bin/python" -u tests/smoke_installed.py "${HOME}/TDPlay/runtime/app" 2>&1 | tee smoke.log
+
+      - name: Test suite with the installed packages
+        timeout-minutes: 25
+        run: |
+          set -o pipefail
+          "${HOME}/TDPlay/runtime/bin/uv" pip install --python "${HOME}/TDPlay/runtime/venv/bin/python" pytest pytest-timeout
+          PATH="${HOME}/TDPlay/runtime/bin:${PATH}" "${HOME}/TDPlay/runtime/venv/bin/python" -u -m pytest tests -v -rs \
+            --timeout=300 2>&1 | tee pytest.log
+
+      - name: Show what failed
+        if: failure()
+        run: python3 .github/annotate.py macOS "${HOME}/TDPlay/logs/setup.log" smoke.log pytest.log
+
+      - name: Add the disk image to the draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/*.dmg --clobber
+
+  windows:
+    name: Windows installer
+    needs: [draft]
+    if: ${{ !cancelled() && needs.draft.result != 'failure' }}
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Where the installer puts the app (per user, no administrator rights)
+        run: '"APP=$env:LOCALAPPDATA\Programs\TDPlay AI Video Render" >> $env:GITHUB_ENV'
+
+      - name: Build Setup.exe
+        run: |
+          $version = (Select-String -Path tdplay\__init__.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc /Q "/DAppVersion=$version" windows\installer\TDPlay.iss
+          if ($LASTEXITCODE) { exit 1 }
+          Get-ChildItem dist
+
+      - name: Install silently (CPU PyTorch, since the runner has no GPU)
+        run: |
+          $setup = (Get-ChildItem dist\TDPlay-AI-Video-Render-Setup-*.exe).FullName
+          $p = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=install.log', '/setupargs=-TestCpu' -Wait -PassThru
+          "Setup exit code: $($p.ExitCode)"
+          if ($p.ExitCode) { exit 1 }
+          Select-String -Path install.log -Pattern "install.ps1" | ForEach-Object { $_.Line }
+          if (Test-Path "$env:APP\setup.log") { Get-Content "$env:APP\setup.log" }
+          if (-not (Test-Path "$env:APP\.venv\Scripts\pythonw.exe")) {
+            Copy-Item "$env:APP\setup.log" installer-setup.log -ErrorAction SilentlyContinue
+            # The setup window's output isn't captured: run it again here to see what went wrong.
+            powershell -NoProfile -ExecutionPolicy Bypass -File "$env:APP\windows\install.ps1" -FromInstaller -TestCpu -SkipModel -NoPause *>&1 | Tee-Object setup.log
+            exit 1
+          }
+          foreach ($f in @("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\TDPlay AI Video Render.lnk",
+                           "$env:APP\vendor\ffmpeg\bin\ffmpeg.exe", "$env:APP\vendor\uv\uv.exe", "$env:APP\unins000.exe")) {
+            if (-not (Test-Path $f)) { "Missing: $f"; exit 1 }
+          }
+
+      - name: Smoke test the installed app
+        timeout-minutes: 10
+        run: |
+          & "$env:APP\.venv\Scripts\python.exe" -u tests\smoke_installed.py $env:APP *>&1 | Tee-Object smoke.log
+          if ($LASTEXITCODE) { exit 1 }
+
+      - name: Test suite with the installed packages
+        timeout-minutes: 30
+        env:
+          TDPLAY_PWSH: powershell
+        run: |
+          $env:PATH = "$env:APP\vendor\ffmpeg\bin;$env:PATH"
+          & "$env:APP\vendor\uv\uv.exe" pip install --python "$env:APP\.venv\Scripts\python.exe" pytest pytest-timeout
+          & "$env:APP\.venv\Scripts\python.exe" -u -m pytest tests -v -rs --timeout=300 --ignore=tests/test_macos_bundle.py --ignore=tests/test_scripts.py *>&1 | Tee-Object pytest.log
+          if ($LASTEXITCODE) { exit 1 }
+
+      - name: Uninstall
+        run: |
+          Start-Process "$env:APP\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -Wait
+          for ($i = 0; $i -lt 60 -and (Test-Path "$env:APP\.venv"); $i++) { Start-Sleep 2 }
+          if (Test-Path "$env:APP\.venv") { "The uninstaller left $env:APP\.venv"; exit 1 }
+          if (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\TDPlay AI Video Render.lnk") { "Shortcut left"; exit 1 }
+
+      - name: Show what failed
+        if: failure()
+        run: python .github/annotate.py Windows installer-setup.log setup.log smoke.log pytest.log install.log
+
+      - name: Add Setup.exe to the draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload $env:GITHUB_REF_NAME (Get-ChildItem dist\TDPlay-AI-Video-Render-Setup-*.exe).FullName --clobber
+
+  release:
+    name: Publish the release
+    needs: [macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest

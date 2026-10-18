@@ -28,6 +28,21 @@ one-time model download everything runs offline on your computer.
 
 ## Install on a Mac (once)
 
+1. Download **`TDPlay-AI-Video-Render-<version>.dmg`** from the
+   [Releases](https://github.com/mircix/TDPlay-AI-Video-Render/releases) page, open it and drag
+   **TDPlay AI Video Render** onto **Applications**.
+2. Open it from Applications. The app is free and not registered with Apple, so the first time macOS says it can't
+   check it for malicious software. Click **Done**, open **System Settings → Privacy & Security**, scroll down and
+   click **Open Anyway**. You only do this once.
+3. On its first launch the app sets itself up: it downloads Python, Apple's MLX, the LTX-2 code and ffmpeg (about
+   1 GB, a few minutes) into `~/TDPlay/runtime`, with a small window while it works. No Terminal, Homebrew or
+   password needed. Then it opens; download the model in its **Models** tab (30–45 GB).
+
+It opens in its own window; drag its icon to the Dock to keep it there. Quit it like any app (⌘Q): a video that is
+being made keeps going.
+
+### …or from the source folder
+
 1. Get the `TDPlay-AI-Video-Render` folder (clone it from GitHub, or unzip `TDPlay-AI-Video-Render.zip`) and keep it
    somewhere permanent, for example your home folder or your Claude Workspace folder.
 2. Double-click **`install.command`**.
@@ -127,19 +142,23 @@ the lower resolutions. 8–12 GB cards are likely too small.
 
 ### Install on Windows (once)
 
-1. Get the `TDPlay-AI-Video-Render` folder (clone it, or unzip the zip) and keep it somewhere permanent, for example
-   `C:\TDPlay-AI-Video-Render`. Avoid OneDrive-synced folders: the install is several GB.
-2. Double-click **`install.bat`**.
-   * If Windows says "Windows protected your PC": **More info** → **Run anyway**.
-   * The installer finds your graphics card and installs [uv](https://docs.astral.sh/uv/) (which installs Python
-     3.13), ffmpeg (via winget), Lightricks' LTX-2 code, and **AMD's ROCm PyTorch for your card** (RX 7900 →
-     `gfx1100`, RX 7800/7700 → `gfx1101`, RX 7600 → `gfx1102`, RX 9060 → `gfx1200`, RX 9070 / R9700 → `gfx1201`).
-     It then checks that PyTorch can see the GPU.
-   * It adds **TDPlay AI Video Render** to the Start menu and the desktop, and offers to download the model
-     (about 55 GB). You can also do that later in the app's **Models** tab.
+1. Download **`TDPlay-AI-Video-Render-Setup-<version>.exe`** from the
+   [Releases](https://github.com/mircix/TDPlay-AI-Video-Render/releases) page and run it. If Windows says "Windows
+   protected your PC": **More info** → **Run anyway**. It installs for your user only (no administrator rights),
+   into `%LOCALAPPDATA%\Programs\TDPlay AI Video Render`.
+2. After copying the app, a setup window finds your graphics card and installs
+   [uv](https://docs.astral.sh/uv/) (which installs Python 3.13), ffmpeg, Lightricks' LTX-2 code, and **AMD's ROCm
+   PyTorch for your card** (RX 7900 → `gfx1100`, RX 7800/7700 → `gfx1101`, RX 7600 → `gfx1102`, RX 9060 →
+   `gfx1200`, RX 9070 / R9700 → `gfx1201`).
+   It then checks that PyTorch can see the GPU, and offers to download the model (about 55 GB). You can also do that
+   later in the app's **Models** tab. If something goes wrong, fix it and open **TDPlay AI Video Render - repair
+   setup** from the Start menu.
 3. Open **TDPlay AI Video Render** from the Start menu or the desktop. It opens in its own window, in dark or light
    mode like Windows. Closing it doesn't stop a video that is being made.
-   * `start.bat` opens the same app in your web browser, with a window showing the log.
+   * `start.bat` (in the install folder) opens the same app in your web browser, with a window showing the log.
+
+**From the source folder instead:** get the `TDPlay-AI-Video-Render` folder, keep it somewhere permanent (not in a
+OneDrive-synced folder) and double-click **`install.bat`**. It does the same setup and makes the shortcuts.
 
 ### Recommended settings on Windows
 
@@ -223,19 +242,27 @@ H3 is a larger cloud model. Expect LTX-2 on a laptop to be good but not identica
 
 ## Where things are
 
-* The app: `/Applications/TDPlay AI Video Render.app` (or `~/Applications` if `/Applications` isn't writable). It
-  is a small launcher for this folder.
 * Projects: `~/TDPlay/projects/<date>_<title>/render.mp4` (plus `render_1080p.mp4` / `render_4k.mp4` if upscaled)
 * Models: `~/TDPlay/models/` (delete a folder there to free its space)
-* App code: this folder (`.venv/` and `vendor/` are created by the installer)
-* On Windows, `~` is your user folder (`C:\Users\<you>`), and the app is a Start menu / desktop shortcut.
+* Logs: `~/TDPlay/logs/` (`app.log`; `setup.log` for the Mac app's first-launch setup)
+* The Mac app from the disk image: `/Applications/TDPlay AI Video Render.app`, which sets up Python and the packages
+  in `~/TDPlay/runtime`.
+* The Windows app from Setup.exe: `%LOCALAPPDATA%\Programs\TDPlay AI Video Render` (`.venv\` and `vendor\` in it are
+  made by the setup).
+* From the source folder: the app is a launcher for this folder, which holds `.venv/` and `vendor/`.
+* On Windows, `~` is your user folder (`C:\Users\<you>`).
 
 ## Update or uninstall
 
-* **Update**: `git pull` in this folder (or replace it with a new version), then run `install.command` again
-  (`install.bat` on Windows). Models and projects stay in `~/TDPlay`.
-* **Uninstall**: delete the app from Applications, this folder, and `~/TDPlay`. ffmpeg and uv can be removed with
-  `brew uninstall ffmpeg uv`. On Windows: delete the shortcuts, this folder and `%USERPROFILE%\TDPlay`.
+* **Update**: install the new version over the old one: drag the new app from the disk image onto Applications
+  (**Replace**), or run the new Setup.exe. The app sets itself up again on the next launch, which is quick. From
+  the source folder: `git pull`, then run `install.command` / `install.bat` again. Models and projects stay in
+  `~/TDPlay`.
+* **Uninstall on a Mac**: drag the app to the Trash and delete `~/TDPlay` (models, videos and the runtime). From the
+  source folder, also delete the folder; ffmpeg and uv can be removed with `brew uninstall ffmpeg uv`.
+* **Uninstall on Windows**: **Settings → Apps → Installed apps → TDPlay AI Video Render → Uninstall**. It asks whether
+  to delete `%USERPROFILE%\TDPlay` (models and videos) too. From the source folder: delete the shortcuts, the folder
+  and `%USERPROFILE%\TDPlay`.
 
 ## Credits and licenses
 
@@ -281,9 +308,18 @@ The Windows backend has its own stand-in, `tests/fake_ltx_torch.py`, and `tests/
 chunk plan through the real `ltx_pipelines` classes on the CPU (it skips if `ltx_pipelines` isn't installed).
 `tests/test_windows_scripts.py` checks that the `.bat`/`.ps1` files are ASCII with CRLF line endings and, with
 `TDPLAY_PWSH` set to a PowerShell binary, parses the installer and tests its graphics card detection.
+`tests/test_worker.py` covers background jobs: a render outliving the app that started it, Stop, and a window
+reopening onto a running job.
+
+**Installers.** `bash macos/build_dmg.sh` builds the Mac disk image (on a Mac), and
+`iscc /DAppVersion=1.2.0 windows\installer\TDPlay.iss` the Windows Setup.exe ([Inno Setup 6](https://jrsoftware.org/isinfo.php)).
+The *Installers* GitHub workflow (`.github/workflows/installers.yml`) builds both, installs each one the way a user
+would (the Windows one with CPU PyTorch, as the runner has no GPU), runs `tests/smoke_installed.py` and the test
+suite against the installed packages, and publishes both on a release when a `v*` tag is pushed.
 
 Layout: `tdplay/engine.py` (Mac segment chaining, joins, resume) · `tdplay/engine_torch.py` and
 `tdplay/ltx_torch.py` (Windows: the whole shot as one LTX-2 run) · `tdplay/media.py` (ffmpeg I/O) ·
 `tdplay/models.py` (presets, downloads) · `tdplay/upscale.py` (Real-ESRGAN on MLX or PyTorch) · `tdplay/app.py`
-(Gradio UI) · `tdplay/desktop_app.py` (app window, Mac and Windows) · `tdplay/macos_bundle.py` (the .app) ·
-`windows/install.ps1` (Windows installer) · `scripts/make_icon.py` (the icon).
+(Gradio UI) · `tdplay/worker.py` (background jobs) · `tdplay/desktop_app.py` (app window, Mac and Windows) ·
+`tdplay/macos_bundle.py` (the .app) · `macos/` (disk image and its first-launch setup) · `windows/install.ps1`
+(Windows setup) · `windows/installer/` (Setup.exe) · `scripts/make_icon.py` (the icon).

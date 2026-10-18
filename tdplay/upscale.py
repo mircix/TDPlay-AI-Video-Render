@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -207,7 +206,7 @@ class Upscaler(_Tiled):
 
 
 def _encoder_args(width: int, height: int) -> list[str]:
-    encoders = subprocess.run([shutil.which("ffmpeg") or "ffmpeg", "-hide_banner", "-encoders"],
+    encoders = subprocess.run([media.tool("ffmpeg"), "-hide_banner", "-encoders"],
                               capture_output=True, text=True, **media.NO_WINDOW).stdout
     four_k = width * height > 2_500_000
     if four_k and "hevc_videotoolbox" in encoders:  # the Mac's hardware encoder
@@ -223,7 +222,7 @@ def upscale_video(src: str | Path, dst: str | Path, width: int, height: int, qua
     info = media.probe(src)
     model = make_upscaler(quality)
     sw, sh = info.width * SCALE, info.height * SCALE
-    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    ffmpeg = media.tool("ffmpeg")
     reader = subprocess.Popen(
         [ffmpeg, "-v", "error", "-i", str(src), "-map", "0:v:0", "-fps_mode", "passthrough",
          "-pix_fmt", "rgb24", "-f", "rawvideo", "-"], stdout=subprocess.PIPE, **media.NO_WINDOW)
