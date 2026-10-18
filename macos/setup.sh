@@ -105,6 +105,12 @@ PY="${RUNTIME}/venv/bin/python"
 step "Installing the app"
 rm -rf "${RUNTIME}/app.new" "${RUNTIME}/app.old"
 ditto --noqtn "${SRC}" "${RUNTIME}/app.new"
+# The app looks for ffmpeg in its own vendor/ffmpeg/bin first (tdplay/media.py), whatever PATH says.
+mkdir -p "${RUNTIME}/app.new/vendor/ffmpeg/bin"
+for tool in ffmpeg ffprobe; do
+  if [[ -x "${BIN}/${tool}" ]]; then src="${BIN}/${tool}"; else src="/opt/homebrew/bin/${tool}"; fi
+  ln -sf "${src}" "${RUNTIME}/app.new/vendor/ffmpeg/bin/${tool}"
+done
 if [[ -d "${RUNTIME}/app" ]]; then mv "${RUNTIME}/app" "${RUNTIME}/app.old"; fi
 mv "${RUNTIME}/app.new" "${RUNTIME}/app"
 rm -rf "${RUNTIME}/app.old"
@@ -114,7 +120,7 @@ step "Checking"
   || fail "MLX could not use this Mac's GPU."
 "${PY}" -m ltx_pipelines_mlx --help >/dev/null || fail "ltx-2-mlx did not install correctly."
 (cd "${RUNTIME}/app" && "${PY}" -c "import tdplay.app") || fail "The app did not install correctly."
-PATH="${BIN}:/opt/homebrew/bin:${PATH}" ffprobe -version | head -1
+"${RUNTIME}/app/vendor/ffmpeg/bin/ffprobe" -version | head -1
 
 cp "${SRC}/VERSION" "${RUNTIME}/VERSION"
 rm -rf "${TMP}"

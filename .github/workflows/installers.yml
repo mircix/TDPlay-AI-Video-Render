@@ -12,6 +12,11 @@ on:
 permissions:
   contents: write
 
+# A new push replaces a run that is still going (macOS minutes count ten times).
+concurrency:
+  group: installers-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   macos:
     name: Mac disk image
@@ -35,13 +40,18 @@ jobs:
           cat "${HOME}/TDPlay/logs/setup.log"
 
       - name: Smoke test the installed app
-        run: '"${HOME}/TDPlay/runtime/venv/bin/python" tests/smoke_installed.py "${HOME}/TDPlay/runtime/app" 2>&1 | tee smoke.log'
-
-      - name: Test suite with the installed packages
+        timeout-minutes: 10
         run: |
           set -o pipefail
-          "${HOME}/TDPlay/runtime/bin/uv" pip install --python "${HOME}/TDPlay/runtime/venv/bin/python" pytest
-          PATH="${HOME}/TDPlay/runtime/bin:${PATH}" "${HOME}/TDPlay/runtime/venv/bin/python" -m pytest tests -q -rs 2>&1 | tee pytest.log
+          "${HOME}/TDPlay/runtime/venv/bin/python" -u tests/smoke_installed.py "${HOME}/TDPlay/runtime/app" 2>&1 | tee smoke.log
+
+      - name: Test suite with the installed packages
+        timeout-minutes: 25
+        run: |
+          set -o pipefail
+          "${HOME}/TDPlay/runtime/bin/uv" pip install --python "${HOME}/TDPlay/runtime/venv/bin/python" pytest pytest-timeout
+          PATH="${HOME}/TDPlay/runtime/bin:${PATH}" "${HOME}/TDPlay/runtime/venv/bin/python" -u -m pytest tests -v -rs \
+            --timeout=300 2>&1 | tee pytest.log
 
       - name: Show what failed
         if: failure()
@@ -80,7 +90,10 @@ jobs:
           $p = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=install.log', '/setupargs=-TestCpu' -Wait -PassThru
           "Setup exit code: $($p.ExitCode)"
           if ($p.ExitCode) { exit 1 }
+          Select-String -Path install.log -Pattern "install.ps1" | ForEach-Object { $_.Line }
+          if (Test-Path "$env:APP\setup.log") { Get-Content "$env:APP\setup.log" }
           if (-not (Test-Path "$env:APP\.venv\Scripts\pythonw.exe")) {
+            Copy-Item "$env:APP\setup.log" installer-setup.log -ErrorAction SilentlyContinue
             # The setup window's output isn't captured: run it again here to see what went wrong.
             powershell -NoProfile -ExecutionPolicy Bypass -File "$env:APP\windows\install.ps1" -FromInstaller -TestCpu -SkipModel -NoPause *>&1 | Tee-Object setup.log
             exit 1
@@ -91,17 +104,19 @@ jobs:
           }
 
       - name: Smoke test the installed app
+        timeout-minutes: 10
         run: |
-          & "$env:APP\.venv\Scripts\python.exe" tests\smoke_installed.py $env:APP *>&1 | Tee-Object smoke.log
+          & "$env:APP\.venv\Scripts\python.exe" -u tests\smoke_installed.py $env:APP *>&1 | Tee-Object smoke.log
           if ($LASTEXITCODE) { exit 1 }
 
       - name: Test suite with the installed packages
+        timeout-minutes: 30
         env:
           TDPLAY_PWSH: powershell
         run: |
           $env:PATH = "$env:APP\vendor\ffmpeg\bin;$env:PATH"
-          & "$env:APP\vendor\uv\uv.exe" pip install --python "$env:APP\.venv\Scripts\python.exe" pytest
-          & "$env:APP\.venv\Scripts\python.exe" -m pytest tests -q -rs --ignore=tests/test_macos_bundle.py --ignore=tests/test_scripts.py *>&1 | Tee-Object pytest.log
+          & "$env:APP\vendor\uv\uv.exe" pip install --python "$env:APP\.venv\Scripts\python.exe" pytest pytest-timeout
+          & "$env:APP\.venv\Scripts\python.exe" -u -m pytest tests -v -rs --timeout=300 --ignore=tests/test_macos_bundle.py --ignore=tests/test_scripts.py *>&1 | Tee-Object pytest.log
           if ($LASTEXITCODE) { exit 1 }
 
       - name: Uninstall
@@ -113,7 +128,7 @@ jobs:
 
       - name: Show what failed
         if: failure()
-        run: python .github/annotate.py Windows install.log setup.log smoke.log pytest.log
+        run: python .github/annotate.py Windows installer-setup.log setup.log smoke.log pytest.log install.log
 
       - uses: actions/upload-artifact@v4
         with:

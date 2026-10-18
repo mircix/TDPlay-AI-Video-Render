@@ -70,7 +70,7 @@ def _keep_awake() -> None:
         es_continuous, es_system_required = 0x80000000, 0x00000001
         ctypes.windll.kernel32.SetThreadExecutionState(es_continuous | es_system_required)
     elif shutil.which("caffeinate"):
-        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def _log_to_file_without_console() -> None:

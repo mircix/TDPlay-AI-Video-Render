@@ -62,7 +62,11 @@ if ($DefineOnly) { return }
 trap { Fail ("The setup stopped: " + $_.Exception.Message) }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
+# A log next to the app, for when the window closed too fast to read (PowerShell 5.1 leaves out
+# the output of programs like pip here; the steps and any error are in it).
+Start-Transcript -Path (Join-Path $Root "setup.log") -Force | Out-Null
 Say "TDPlay AI Video Render setup"
+Write-Host ("Options: " + (($PSBoundParameters.Keys | ForEach-Object { "-$_" }) -join " "))
 
 # --- This PC ------------------------------------------------------------------------------
 $build = [int](Get-CimInstance Win32_OperatingSystem).BuildNumber

@@ -85,8 +85,10 @@ begin
   WizardForm.StatusLabel.Caption := 'Setting up Python, PyTorch for your graphics card and LTX-2. ' +
     'This downloads a few GB; the window that opened shows the progress.';
   WizardForm.ProgressGauge.Style := npbstMarquee;
+  Log('Running install.ps1 ' + Args);
   SetupOk := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Args, ExpandConstant('{app}'),
                   SW_SHOW, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+  Log('install.ps1 exit code: ' + IntToStr(ResultCode));
   WizardForm.ProgressGauge.Style := npbstNormal;
   if not SetupOk then
     SuppressibleMsgBox('The setup did not finish (exit code ' + IntToStr(ResultCode) + ').' + #13#10#13#10 +

@@ -14,7 +14,7 @@ def main() -> None:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
-        tail = "\n".join(lines[-80:])
+        tail = "\n".join(line[:300] for line in lines[-50:])
         message = tail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
         print(f"::error title={title} ({path.name})::{message}")
 

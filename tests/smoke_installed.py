@@ -64,6 +64,7 @@ def check_render(home: Path) -> None:
     assert frames == 49 + 24, frames
     assert proc.wait(timeout=60) == 0 and not worker.is_running(project.dir)
     print(f"2. a {frames}-frame shot rendered as a background job", flush=True)
+    print(f"   ffmpeg: {media.tool('ffmpeg')}", flush=True)
 
 
 def main() -> None:
@@ -77,6 +78,9 @@ def main() -> None:
     env = dict(os.environ, TDPLAY_HOME=str(home), TDPLAY_NO_NOTIFY="1",
                TDPLAY_LTX_CMD=shlex.join([sys.executable, str(fake)]),
                TDPLAY_TORCH_CMD=shlex.join([sys.executable, str(fake)]))
+    from tdplay import media
+
+    env["PATH"] = os.pathsep.join([str(Path(media.tool("ffmpeg")).parent), env.get("PATH", "")])
     os.environ.update(env)
     check_server(app_root, env)
     check_render(home)
