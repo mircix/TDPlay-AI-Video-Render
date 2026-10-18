@@ -68,6 +68,10 @@ being made keeps going.
 3. Press **Generate**. The shot so far appears after every segment, so you can watch it grow.
 4. The finished `render.mp4` is in the project folder (**Open project folder**).
 
+Projects are saved in `TDPlay/projects` in your home folder. To save them somewhere else (another drive, say), open
+the **Projects** tab: **Choose…** picks a folder, or type its path and press **Use this folder**. Projects made
+before stay where they are and are still listed.
+
 **Renders run in the background.** Close the window or quit the app whenever you like: the video keeps being made,
 and you get a notification when it's done. Open the app again to see the progress or the result. Only **Stop** stops
 it.

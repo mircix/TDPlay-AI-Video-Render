@@ -118,3 +118,62 @@ def test_scene_builder_makes_the_first_frame(tmp_path, monkeypatch):
     *_, (_, _, _, note) = app.build_scene(None, None, None, None, 25, 50, 75, 95, 95, 95, 70, 70, 70, "", "", "",
                                           "576p", "16:9 landscape")
     assert note.startswith("⚠️ Add a location picture")
+
+
+def test_projects_can_be_saved_in_another_folder(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tdplay import app, engine, models
+    from test_engine import make_settings
+
+    monkeypatch.setattr(models, "HOME", tmp_path / "home")
+    monkeypatch.setattr(app, "PROJECTS_DIR", tmp_path / "home" / "projects")
+    demo = SimpleNamespace(allowed_paths=[str(tmp_path / "home")])
+    monkeypatch.setitem(app._state, "demo", demo)
+    assert app.projects_dir() == app.PROJECTS_DIR
+    old = engine.create_project(app.projects_dir(), make_settings(), [engine.Segment("made in the default", 2)])
+
+    assert app.use_projects_dir("Videos")[1].startswith("⚠️ Give the folder's full path")
+    blocker = tmp_path / "a file"
+    blocker.write_text("x")
+    assert app.use_projects_dir(str(blocker / "sub"))[1].startswith("⚠️ Can't save projects in")
+    assert app.projects_dir() == app.PROJECTS_DIR  # nothing changed
+
+    chosen = tmp_path / "D drive" / "TDPlay videos"
+    box, note, _ = app.use_projects_dir(f'"{chosen}"')  # Windows' "Copy as path" adds quotes
+    assert box == str(chosen) and chosen.is_dir() and app.projects_dir() == chosen
+    assert str(chosen) in demo.allowed_paths  # the window may show the videos saved there
+    new = engine.create_project(app.projects_dir(), make_settings(), [engine.Segment("made in the chosen", 2)])
+    assert {value for _, value in app.project_choices()} == {str(old.dir), str(new.dir)}
+
+    other = tmp_path / "E"
+    app.use_projects_dir(str(other))
+    assert app.projects_dir() == other and chosen in app.project_folders()  # still listed
+    box, _, _ = app.use_projects_dir("")  # an empty box goes back to the default
+    assert box == str(app.PROJECTS_DIR) and app.projects_dir() == app.PROJECTS_DIR
+    assert set(app.project_folders()) == {app.PROJECTS_DIR, chosen, other}
+
+
+def test_choose_opens_the_app_windows_folder_picker(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from tdplay import app, models
+
+    monkeypatch.setattr(models, "HOME", tmp_path / "home")
+    monkeypatch.setitem(app._state, "demo", None)
+    picked, calls = [str(tmp_path / "picked")], []
+
+    class Window:
+        def create_file_dialog(self, dialog_type, directory=""):
+            calls.append((dialog_type, directory))
+            return tuple(picked) or None
+
+    webview = SimpleNamespace(windows=[Window()], FileDialog=SimpleNamespace(FOLDER=20))
+    monkeypatch.setitem(sys.modules, "webview", webview)
+    box, _, _ = app.pick_projects_dir(str(tmp_path))
+    assert box == picked[0] and calls == [(20, str(tmp_path))] and app.projects_dir() == tmp_path / "picked"
+    picked.clear()  # cancelled: nothing changes
+    assert app.pick_projects_dir(str(tmp_path))[1] == "" and app.projects_dir() == tmp_path / "picked"
+    webview.windows.clear()  # in a browser there is no window of the app's own
+    assert "Type or paste" in app.pick_projects_dir("")[1]

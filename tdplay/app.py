@@ -63,7 +63,7 @@ ENGINE_LABEL = "LTX-2 via MLX" if ON_MAC else "LTX-2 via PyTorch (AMD ROCm / NVI
 COMPUTER = "Mac" if sys.platform == "darwin" else "PC"
 
 # job: (project folder, worker process) of the last job this app started.
-_state: dict = {"job": None, "last_project": None}
+_state: dict = {"job": None, "last_project": None, "demo": None}
 BACKGROUND_NOTE = "It keeps going if you close this window."
 #: How long after a job ended a newly opened window still shows how it ended.
 RECENT_SECONDS = 24 * 3600
@@ -101,6 +101,21 @@ def save_pref(key: str, value) -> None:
     prefs[key] = value
     _prefs_path().parent.mkdir(parents=True, exist_ok=True)
     _prefs_path().write_text(json.dumps(prefs, indent=2), encoding="utf-8")
+
+
+def projects_dir() -> Path:
+    """Where new projects are saved: the folder chosen in the Projects tab, else ``PROJECTS_DIR``."""
+    chosen = load_prefs().get("projects_dir")
+    return Path(chosen) if chosen else PROJECTS_DIR
+
+
+def project_folders() -> list[Path]:
+    """Every folder projects were saved in: the current one, the ones chosen before, the default."""
+    folders: list[Path] = []
+    for folder in [projects_dir(), *map(Path, load_prefs().get("earlier_projects_dirs", [])), PROJECTS_DIR]:
+        if folder not in folders:
+            folders.append(folder)
+    return folders
 
 
 def theme_pref() -> str:
@@ -230,8 +245,8 @@ def open_folder(path: str | None = None) -> None:
     """Show a project's folder in Finder / File Explorer: ``path``, else the latest project, else all of them."""
     path = path or _state["last_project"] or latest_project()
     if not path or not Path(path).exists():
-        PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-        path = str(PROJECTS_DIR)
+        projects_dir().mkdir(parents=True, exist_ok=True)
+        path = str(projects_dir())
     if os.name == "nt":
         os.startfile(path)  # Windows has no "open" command
     else:
@@ -249,9 +264,10 @@ def active_job() -> str | None:
     job = _state["job"]
     if job is not None and job[1].poll() is None:  # started by this app and still running (or starting)
         return job[0]
-    for lock in PROJECTS_DIR.glob(f"*/{worker.LOCK}"):  # started earlier, e.g. before the app was reopened
-        if worker.is_running(lock.parent):
-            return str(lock.parent)
+    for folder in project_folders():  # started earlier, e.g. before the app was reopened
+        for lock in folder.glob(f"*/{worker.LOCK}"):
+            if worker.is_running(lock.parent):
+                return str(lock.parent)
     return None
 
 
@@ -341,16 +357,26 @@ def generate(image, start_video, characters, n, *rest):
     )
     segments = [engine.Segment(str(p or ""), int(s)) for p, s in zip(prompts[:n], seconds[:n])]
     try:
-        project = engine.create_project(PROJECTS_DIR, settings, segments, reference_image=image or None,
+        project = engine.create_project(projects_dir(), settings, segments, reference_image=image or None,
                                         start_video=start_video or None, characters=characters or "")
+    except OSError as exc:  # the projects folder is on a drive that's gone, say
+        yield status_html(f"Can't save the project in {projects_dir()}: {exc.strerror or exc}. Choose another "
+                          "folder in the Projects tab.", tone="error"), None, gr.skip()
+        return
     except (ValueError, RuntimeError) as exc:
         yield status_html(str(exc), tone="error"), None, gr.skip()
         return
     yield from _start(project, ["render"])
 
 
+def all_projects() -> list[engine.Project]:
+    """The projects in every projects folder, newest first (their folder names start with the date)."""
+    projects = [p for folder in project_folders() for p in engine.list_projects(folder)]
+    return sorted(projects, key=lambda p: p.dir.name, reverse=True)
+
+
 def latest_project() -> str | None:
-    projects = engine.list_projects(PROJECTS_DIR)
+    projects = all_projects()
     return str(projects[0].dir) if projects else None
 
 
@@ -391,7 +417,8 @@ def attach():
         job = _state["job"]
         yield from _watch(project_dir, job[1] if job is not None and job[0] == project_dir else None)
         return
-    events = sorted(PROJECTS_DIR.glob(f"*/{worker.EVENTS}"), key=lambda path: path.stat().st_mtime)
+    events = sorted((path for folder in project_folders() for path in folder.glob(f"*/{worker.EVENTS}")),
+                    key=lambda path: path.stat().st_mtime)
     if events and time.time() - events[-1].stat().st_mtime < RECENT_SECONDS:
         _state["last_project"] = str(events[-1].parent)
         yield from _watch(str(events[-1].parent))
@@ -425,7 +452,7 @@ def stop():
 
 def project_choices() -> list[tuple[str, str]]:
     choices = []
-    for p in engine.list_projects(PROJECTS_DIR):
+    for p in all_projects():
         label = (f"{p.created.replace('T', ' ')[:16]} · {p.title[:60]} · {project_status(p)} "
                  f"({p.done}/{len(p.segments)})")
         choices.append((label, str(p.dir)))
@@ -441,6 +468,55 @@ def project_status(p: engine.Project) -> str:
 def refresh_projects():
     choices = project_choices()
     return gr.update(choices=choices, value=choices[0][1] if choices else None)
+
+
+def _serve(folder: Path) -> None:
+    """Let the window show videos from ``folder`` (Gradio serves files only from folders it was allowed)."""
+    demo = _state["demo"]
+    if demo is not None and str(folder) not in demo.allowed_paths:
+        demo.allowed_paths.append(str(folder))
+
+
+def use_projects_dir(text):
+    """Save new projects in the folder ``text`` (made if it doesn't exist); empty means the default folder."""
+    raw = str(text or "").strip().strip('"')
+    folder = Path(raw).expanduser() if raw else PROJECTS_DIR
+    if not folder.is_absolute():
+        example = r"D:\Videos\TDPlay" if os.name == "nt" else "/Users/you/Movies/TDPlay"
+        return gr.skip(), f"⚠️ Give the folder's full path, like `{example}`.", gr.skip()
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        probe = folder / ".tdplay-write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        return gr.skip(), f"⚠️ Can't save projects in `{folder}`: {exc.strerror or exc}", gr.skip()
+    old = projects_dir()
+    if folder != old:  # projects already made stay where they are: keep listing that folder
+        earlier = [d for d in load_prefs().get("earlier_projects_dirs", []) if Path(d) != folder]
+        if old != PROJECTS_DIR and str(old) not in earlier:
+            earlier.append(str(old))
+        save_pref("earlier_projects_dirs", earlier)
+    save_pref("projects_dir", "" if folder == PROJECTS_DIR else str(folder))
+    _serve(folder)
+    return (str(folder), f"New projects are saved in `{folder}`. Projects made before stay where they are and "
+                         "are still listed here.", refresh_projects())
+
+
+def pick_projects_dir(current):
+    """The app window's own folder picker; in a browser the path is typed in instead."""
+    try:
+        import webview
+
+        window = webview.windows[0] if webview.windows else None
+    except ImportError:
+        window = None
+    if window is None:
+        return gr.skip(), "Type or paste the folder's path, then press **Use this folder**.", gr.skip()
+    chosen = window.create_file_dialog(webview.FileDialog.FOLDER, directory=str(current or projects_dir()))
+    if not chosen:  # cancelled
+        return gr.skip(), "", gr.skip()
+    return use_projects_dir(chosen[0] if isinstance(chosen, (list, tuple)) else chosen)
 
 
 def show_project(project_dir):
@@ -655,6 +731,12 @@ def build() -> gr.Blocks:
 
             with gr.Tab("Projects", id="projects") as projects_tab:
                 with gr.Row():
+                    folder_box = gr.Textbox(str(projects_dir()), label="New projects are saved in", scale=5)
+                    with gr.Column(scale=1, min_width=140):
+                        pick_folder_btn = gr.Button("Choose…")
+                        use_folder_btn = gr.Button("Use this folder")
+                folder_note = gr.Markdown()
+                with gr.Row():
                     project = gr.Dropdown(project_choices(), label="Your projects", scale=5)
                     refresh_btn = gr.Button("Refresh", scale=1)
                 with gr.Row():
@@ -747,6 +829,11 @@ def build() -> gr.Blocks:
                      show_progress="hidden")
         preset.change(preset_status, preset, status, api_visibility="private")
         projects_tab.select(refresh_projects, None, project, api_visibility="private")
+        projects_tab.select(lambda: str(projects_dir()), None, folder_box, api_visibility="private", queue=False)
+        pick_folder_btn.click(pick_projects_dir, folder_box, [folder_box, folder_note, project],
+                              api_visibility="private")
+        use_folder_btn.click(use_projects_dir, folder_box, [folder_box, folder_note, project],
+                             api_visibility="private")
         models_tab.select(models_table, None, table, api_visibility="private")
         demo.load(models_table, None, table, api_visibility="private")
         # The saved choice is read on every page load, so all windows and browsers agree.
@@ -805,7 +892,8 @@ longer. If a segment fails with "ran out of memory": turn on Low-RAM mode, lower
 segments, close other apps, then press Resume.
 {PLATFORM_NOTE}
 ### Where things are
-- Projects (videos, each segment, a log): `{PROJECTS_DIR}`
+- Projects (videos, each segment, a log): the folder shown in the Projects tab (`{PROJECTS_DIR}` unless you
+  choose another one there)
 - Models: `{models.MODELS_DIR}`
 
 ### Differences from MiniMax H3
@@ -817,15 +905,19 @@ character stays in roughly the same framing.
 
 def launch(*, port: int | None = None, open_browser: bool = True, block: bool = True) -> gr.Blocks:
     """Start the local web server (127.0.0.1 only). With ``block=False`` it returns once the server is up."""
-    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        projects_dir().mkdir(parents=True, exist_ok=True)
+    except OSError:  # a chosen folder that isn't there now (an unplugged drive): the Projects tab says so
+        pass
     demo = build()
+    _state["demo"] = demo
     demo.queue(default_concurrency_limit=1)
     demo.launch(
         server_name="127.0.0.1",
         server_port=port,
         inbrowser=open_browser,
         prevent_thread_lock=not block,
-        allowed_paths=[str(models.HOME)],
+        allowed_paths=[str(models.HOME), *map(str, project_folders())],
         theme=gr.themes.Soft(primary_hue="orange", neutral_hue="slate"),
         css=CSS,
         footer_links=[],
