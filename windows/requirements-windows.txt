@@ -4,7 +4,7 @@ einops
 colour-science
 av
 transformers>=5.8.0,<5.15
-safetensors
+safetensors>=0.8,<0.9  # 0.8 added backend="pread" (see tdplay/ltx_torch.py)
 accelerate
 scipy>=1.14
 tqdm

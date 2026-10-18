@@ -144,6 +144,29 @@ def _to_numpy(piece, fps: int):
     return frames, media.fit_audio(wave.T.contiguous().numpy(), samples)
 
 
+def read_weights_without_mapping() -> None:
+    """Have safetensors read model files with plain reads (``backend="pread"``) instead of mapping them.
+
+    By default safetensors maps a whole file copy-on-write (``torch.UntypedStorage.from_file``), and
+    Windows sets memory aside for all of it up front: the 29.5 GB LTX-2 file doesn't fit on a 32 GB PC.
+    PyTorch doesn't notice that the mapping failed, and loading stops later with "Attempted to access
+    the data pointer on an invalid python storage". The pread backend maps nothing. LTX-2 looks up
+    ``safetensors.safe_open`` each time it opens a file, so this covers all of its loading.
+    """
+    import safetensors
+
+    if getattr(safetensors.safe_open, "tdplay_pread", False):
+        return
+    original = safetensors.safe_open
+
+    def safe_open(filename, framework, device="cpu", **kwargs):
+        kwargs.setdefault("backend", "pread")
+        return original(filename, framework, device=device, **kwargs)
+
+    safe_open.tdplay_pread = True
+    safetensors.safe_open = safe_open
+
+
 def render(job: dict) -> None:
     import torch
     from ltx_core.quantization.fp8_cast import build_policy
@@ -152,6 +175,7 @@ def render(job: dict) -> None:
 
     from tdplay import media
 
+    read_weights_without_mapping()
     out_dir = Path(job["chunks_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     fps = int(job["fps"])

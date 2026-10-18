@@ -75,3 +75,30 @@ def test_prompts_are_encoded_once_and_the_first_reaches_prepare_run():
     assert seen["first"].i == 0 and seen["num_frames"] == 97
     assert isinstance(seen["chunk"], D.ChunkConfig) and seen["chunk"].chunk_pixel_frames == 73
     assert pipe.prompt_encoder is encoder  # restored afterwards
+
+
+def test_weights_are_read_without_mapping_the_files(tmp_path, monkeypatch):
+    """LTX-2's loader goes through safetensors' pread backend (Windows can't map the 29.5 GB model)."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("ltx_core")
+    import safetensors
+    from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+    from safetensors.torch import save_file
+
+    from tdplay.ltx_torch import read_weights_without_mapping
+
+    path = tmp_path / "model.safetensors"
+    save_file({"a.weight": torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)}, str(path))
+    backends = []
+    original = safetensors.safe_open
+
+    def spy(*args, **kwargs):
+        backends.append(kwargs.get("backend"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(safetensors, "safe_open", spy)
+    read_weights_without_mapping()
+    read_weights_without_mapping()  # a second call doesn't wrap twice
+    loaded = SafetensorsStateDictLoader().load(str(path), None, torch.device("cpu"))
+    assert backends == ["pread"]
+    assert loaded.sd["a.weight"].float().sum().item() == 15
