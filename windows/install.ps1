@@ -8,6 +8,13 @@
 param([switch]$DefineOnly, [switch]$FromInstaller, [switch]$SkipModel, [switch]$NoPause, [switch]$TestCpu)
 
 $ErrorActionPreference = "Stop"
+# Started from PowerShell 7 (a terminal, or the installer launched from one), Windows PowerShell would
+# inherit PowerShell 7's module folders and fail to load its own cmdlets: use its own folders.
+if ($PSVersionTable.PSEdition -eq "Desktop") {
+    $env:PSModulePath = @((Join-Path ([Environment]::GetFolderPath("MyDocuments")) "WindowsPowerShell\Modules"),
+                          (Join-Path $env:ProgramFiles "WindowsPowerShell\Modules"),
+                          (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\Modules")) -join ";"
+}
 $ProgressPreference = "SilentlyContinue"   # Invoke-WebRequest is very slow with its progress bar
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
@@ -36,8 +43,16 @@ function Check([string]$What) {
 function Get-Download([string]$Url, [string]$OutFile, [string]$Sha256) {
     # Download, then check the checksum (the versions are pinned, so the checksums are known).
     Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
-    $got = (Get-FileHash -Algorithm SHA256 -Path $OutFile).Hash.ToLower()
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($OutFile)
+    try { $got = -join ($sha.ComputeHash($stream) | ForEach-Object { $_.ToString("x2") }) } finally { $stream.Dispose() }
     if ($got -ne $Sha256) { Fail "The download of $Url is damaged (checksum mismatch). Run the setup again." }
+}
+
+function Expand-Zip([string]$Zip, [string]$Destination) {
+    # .NET instead of Expand-Archive: no PowerShell module needed, and much faster on PowerShell 5.1.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $Destination)
 }
 
 function Get-GpuTarget([string[]]$Names) {
@@ -110,7 +125,7 @@ if (-not ((Test-Path $uv) -and ((& $uv --version) -match [regex]::Escape($UvVers
     $unzip = Join-Path $env:TEMP "tdplay-uv"
     Get-Download $UvUrl $zip $UvSha256
     if (Test-Path $unzip) { Remove-Item $unzip -Recurse -Force }
-    Expand-Archive -Path $zip -DestinationPath $unzip
+    Expand-Zip $zip $unzip
     New-Item -ItemType Directory -Force -Path (Split-Path $uv) | Out-Null
     Copy-Item (Join-Path $unzip "uv-$UvVersion.data\scripts\uv.exe") $uv -Force
     Remove-Item $zip, $unzip -Recurse -Force
@@ -123,7 +138,7 @@ if (-not ((Test-Path $ffmpegMarker) -and ((Get-Content $ffmpegMarker -Raw).Trim(
     $unzip = Join-Path $env:TEMP "tdplay-ffmpeg"
     Get-Download $FfmpegUrl $zip $FfmpegSha256
     if (Test-Path $unzip) { Remove-Item $unzip -Recurse -Force }
-    Expand-Archive -Path $zip -DestinationPath $unzip
+    Expand-Zip $zip $unzip
     if (Test-Path (Join-Path $vendor "ffmpeg")) { Remove-Item (Join-Path $vendor "ffmpeg") -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $ffmpegBin | Out-Null
     $built = Get-ChildItem $unzip | Select-Object -First 1
@@ -145,7 +160,7 @@ if (-not ((Test-Path $marker) -and ((Get-Content $marker -Raw).Trim() -eq $LtxTa
     $unzip = Join-Path $env:TEMP "tdplay-ltx-2"
     Invoke-WebRequest -Uri "https://github.com/Lightricks/LTX-2/archive/refs/tags/$LtxTag.zip" -OutFile $zip -UseBasicParsing
     if (Test-Path $unzip) { Remove-Item $unzip -Recurse -Force }
-    Expand-Archive -Path $zip -DestinationPath $unzip
+    Expand-Zip $zip $unzip
     Move-Item (Get-ChildItem $unzip | Select-Object -First 1).FullName $ltxDir
     Set-Content -Path $marker -Value $LtxTag
     Remove-Item $zip, $unzip -Recurse -Force
