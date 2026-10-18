@@ -177,3 +177,78 @@ def test_choose_opens_the_app_windows_folder_picker(tmp_path, monkeypatch):
     assert app.pick_projects_dir(str(tmp_path))[1] == "" and app.projects_dir() == tmp_path / "picked"
     webview.windows.clear()  # in a browser there is no window of the app's own
     assert "Type or paste" in app.pick_projects_dir("")[1]
+
+
+def test_lora_add_ons_in_the_window(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from tdplay import app, loras, models
+    from test_loras import lora_file
+
+    monkeypatch.setattr(models, "HOME", tmp_path / "home")
+    monkeypatch.setattr(models, "MODELS_DIR", tmp_path / "home" / "models")
+    n = loras.MAX_LORAS
+    empty = [""] * n + [1.0] * n
+    assert [label for label, _ in app.lora_choices()] == ["— none —"]
+
+    # Add a file from where it is (here: a ComfyUI folder), with the app window's file picker.
+    dual = lora_file(tmp_path / "ComfyUI" / "loras" / "ltx2" / "LTX2.3-IC-LORA-Dual-Character.safetensors")
+    picked = [str(dual)]
+    window = SimpleNamespace(create_file_dialog=lambda kind, file_types=(): tuple(picked) or None)
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(windows=[window], FileDialog=SimpleNamespace(OPEN=10)))
+    *slots, note = app.add_lora_file(*empty)
+    assert slots[0]["value"] == str(dual) and slots[n] == 1.0 and "Added **LTX2.3-IC-LORA-Dual-Character" in note
+    assert str(dual) in [path for _, path in slots[0]["choices"]]
+    picked[0] = str(lora_file(tmp_path / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"))
+    assert "isn't needed" in app.add_lora_file(*empty)[-1]  # refused, with the reason
+
+    # Download one of the app's add-ons: it lands in the next free slot at its suggested strength.
+    omni = loras.ADDONS[0]
+
+    def download(repo, patterns):
+        assert (repo, patterns) == (omni.repo, (omni.file,))
+        yield models.DownloadProgress(repo, 100, 617_000_000)
+        lora_file(omni.path)
+        yield models.DownloadProgress(repo, 617_000_000, 617_000_000, finished=True)
+
+    monkeypatch.setattr(models, "download", download)
+    current = [str(dual), "", "", "", 1.0, 1.0, 1.0, 1.0]
+    *slots, note = list(app.addon_downloader(0)(*current))[-1]
+    assert [s["value"] for s in slots[:n]] == [str(dual), str(omni.path), "", ""] and slots[n + 1] == 0.9
+    assert "OmniNFT RL** is ready" in note and not app._state.get("downloading")
+
+    # The slots are remembered for next time.
+    app.remember_loras(str(dual), str(omni.path), "", "", 0.6, 0.9, 1.0, 1.0)
+    restored = app.saved_loras()
+    assert [s["value"] for s in restored[:n]] == [str(dual), str(omni.path), "", ""] and restored[n:n + 2] == [0.6, 0.9]
+    assert app.picked_lora(str(omni.path))[0] == 0.9 and "rank 32" in app.picked_lora(str(dual))[1]
+
+
+def test_a_render_checks_its_loras_first(tmp_path, monkeypatch):
+    from tdplay import app, engine, loras, models
+    from test_loras import lora_file
+
+    monkeypatch.setattr(models, "HOME", tmp_path / "home")
+    monkeypatch.setattr(app, "PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setattr(app, "ON_MAC", False)
+    monkeypatch.setenv("TDPLAY_MODEL_DIR", str(tmp_path / "models"))
+    created = []
+    monkeypatch.setattr(engine, "create_project", lambda root, settings, *a, **k: created.append(settings) or 1 / 0)
+    good = lora_file(tmp_path / "good.safetensors")
+    prompts = ["a shot"] + [""] * (app.MAX_SEGMENTS - 1)
+    seconds = [4] * app.MAX_SEGMENTS
+    settings = ["ltx-2.3-fp8", "576p", "16:9 landscape", True, True, False, 0.0, 8, True, -1, "off", "fast", 1.0]
+
+    def generate(*lora_values):
+        try:
+            return list(app.generate(None, None, "", 1, *prompts, *seconds, *settings, *lora_values))
+        except ZeroDivisionError:  # create_project was reached
+            return None
+
+    assert generate(str(good), "", "", "", 0.7, 1.0, 1.0, 1.0) is None
+    assert created[-1].loras == [{"path": str(good), "strength": 0.7}]
+    assert generate(str(good), "", "", "", 0.0, 1.0, 1.0, 1.0) is None and created[-1].loras == []  # 0 = off
+    missing = generate(str(tmp_path / "gone.safetensors"), "", "", "", 1.0, 1.0, 1.0, 1.0)
+    assert "there any more" in missing[-1][0] and len(created) == 2
+    assert loras.MAX_LORAS == 4

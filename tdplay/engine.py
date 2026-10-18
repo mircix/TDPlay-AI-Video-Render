@@ -147,6 +147,8 @@ class Settings:
     offload: str = "disk"
     #: torch backend: how much of the graphics card the model may use ("balanced" or "max").
     gpu_memory: str = "balanced"
+    #: torch backend: LoRA add-ons, ``[{"path": ..., "strength": ...}]`` (see ``tdplay.loras``).
+    loras: list = field(default_factory=list)
     fps: int = FPS
 
 

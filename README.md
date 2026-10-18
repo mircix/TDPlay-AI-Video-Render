@@ -90,6 +90,23 @@ the scene. Write each one's name and outfit under their photo: building the scen
 A pasted-in person can still look pasted in. On Windows, building a scene also sets **First frame strength**
 (Settings) to 0.85, so the model repaints the first frame a little and blends the light; 1 keeps it exactly as built.
 
+### Add-ons (LoRAs), Windows
+
+LoRAs are add-ons that change how the model renders a whole shot. **Add-ons (LoRAs)** on the Create tab takes up
+to four, each with a strength (0 = off), like ComfyUI's LoRA loaders:
+
+* **Download OmniNFT RL** (617 MB, strength 0.9): sound in sync with the picture, lip sync, steadier video.
+* **Download VBVR I2V** (554 MB, strength 0.7): livelier motion, following longer prompts.
+* **Add a LoRA file…** uses any other LTX-2.3 LoRA from where it is, such as one from Civitai (which needs a login to
+  download, so get it in your browser). Or copy files into the LoRA folder (**Open the LoRA folder**) and press
+  **Refresh the list**.
+
+Each file is checked when you pick it: one in another layout, or for another model, is refused with the reason. The
+*distilled LoRA* isn't needed (the app already runs the distilled model). Most LoRAs were trained on LTX-2.3's full
+*dev* model, so if the picture gets noisy or burnt, lower the strength. The model's 8-bit weights would round most of a
+LoRA's small changes away; the app rounds them up or down at random instead, so they keep their effect on average.
+The Mac version has no add-ons: its model takes LoRAs only for the first segment of a shot.
+
 ### 1080p and 4K
 
 Choose **Final output size** next to Generate: *1080p* or *4K*. After the last segment the finished shot is upscaled

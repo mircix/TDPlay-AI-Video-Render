@@ -243,6 +243,74 @@ def continue_start_video(pieces, tail_path: str, *, fps: int, width: int, height
         yield frames, audio
 
 
+# -- LoRAs on the fp8 model -----------------------------------------------------------------------------
+#
+# LTX-2 folds a LoRA into each fp8 block as it reaches the GPU: dequantize, add the LoRA's change, round
+# back to fp8 (``fp8_cast.fuse_cast_fp8_weight``). A LoRA's change to a weight is often smaller than the
+# gap between the two fp8 numbers around it, so rounding to the nearest one drops it. LTX-2 rounds up or
+# down at random instead, with odds that keep the change on average, but only in a Triton kernel for
+# NVIDIA. Elsewhere (Windows has no Triton; AMD cards) it rounds to nearest. This does the same random
+# rounding in plain PyTorch.
+
+#: fp8 formats: mantissa bits, exponent of the gap between the smallest numbers, largest number.
+_FP8 = {"float8_e4m3fn": (3, -9, 448.0), "float8_e5m2": (2, -16, 57344.0)}
+#: Values rounded at a time: caps the temporary memory at ~0.2 GB whatever the weight's size.
+_CHUNK = 1 << 22
+
+
+def round_to_fp8_stochastically(delta, weight):
+    """``weight + delta`` in ``weight``'s fp8 format, each value rounded up or down at random, in proportion.
+
+    Each value goes to one of the two fp8 numbers around it, with odds by how close it is to each,
+    so the result is right on average.
+    """
+    import torch
+
+    mantissa, smallest, largest = _FP8[str(weight.dtype).removeprefix("torch.")]
+    tiny = 2.0**smallest
+    out = torch.empty_like(weight)
+    flat_out, flat_weight, flat_delta = out.view(-1), weight.reshape(-1), delta.reshape(-1)
+    for start in range(0, flat_weight.numel(), _CHUNK):
+        x = flat_delta[start:start + _CHUNK].float().add_(flat_weight[start:start + _CHUNK].float())
+        a = x.abs().clamp_(max=largest)
+        near = a.to(weight.dtype).float()  # the nearest fp8 magnitude, below or above
+        fraction, exponent = torch.frexp(near)
+        up = torch.where(near == 0, tiny, torch.ldexp(torch.ones_like(near), exponent - 1 - mantissa)).clamp_(min=tiny)
+        down = torch.where(fraction == 0.5, up / 2, up).clamp_(min=tiny)  # below a power of two the gaps halve
+        below = near <= a
+        low, high = torch.where(below, near, near - down), torch.where(below, near + up, near)
+        chosen = torch.where(torch.rand_like(a) * (high - low) < a - low, high, low).clamp_(max=largest)
+        flat_out[start:start + _CHUNK] = torch.copysign(chosen, x).to(weight.dtype)
+    return out
+
+
+def fuse_loras_with_stochastic_rounding() -> None:
+    """Make LTX-2's fp8 LoRA fusion round stochastically where its Triton kernel can't run."""
+    import torch
+    from ltx_core.quantization import fp8_cast
+
+    if getattr(fp8_cast.fuse_cast_fp8_weight, "tdplay", False):
+        return
+    triton_fuse = fp8_cast.fuse_cast_fp8_weight
+
+    def fuse(delta_bf16, weight_fp8):
+        if torch.version.hip is None and fp8_cast._use_triton_fp8_kernel(weight_fp8.device):
+            return triton_fuse(delta_bf16, weight_fp8)
+        return round_to_fp8_stochastically(delta_bf16, weight_fp8)
+
+    fuse.tdplay = True
+    fp8_cast.fuse_cast_fp8_weight = fuse
+
+
+def lora_inputs(job: dict) -> tuple:
+    """The job's LoRAs for LTX-2: ComfyUI-format files (``diffusion_model.`` prefix) with their strengths."""
+    from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
+    from ltx_core.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
+
+    return tuple(LoraPathStrengthAndSDOps(str(lora["path"]), float(lora["strength"]), LTXV_LORA_COMFY_RENAMING_MAP)
+                 for lora in job.get("loras", []))
+
+
 def read_weights_without_mapping() -> None:
     """Have safetensors read model files with plain reads (``backend="pread"``) instead of mapping them.
 
@@ -541,10 +609,15 @@ def render(job: dict) -> None:
     else:
         print("No GPU found by PyTorch: rendering on the CPU will be extremely slow.", flush=True)
 
+    loras = lora_inputs(job)
+    if loras:
+        fuse_loras_with_stochastic_rounding()
+        for lora in loras:
+            print(f"LoRA: {Path(lora.path).name} at strength {lora.strength:g}", flush=True)
     pipeline = _pipeline_class()(
         model_paths=ModelPaths.from_monolith(job["checkpoint"], job["gemma_root"]),
         spatial_upsampler_path=job["upsampler"],
-        loras=(),
+        loras=loras,
         quantization=build_policy(job["checkpoint"]),
         offload_mode=OffloadMode(job["offload"]),
     )

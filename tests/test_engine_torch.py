@@ -45,6 +45,8 @@ def test_job_has_one_prompt_and_length_per_segment(tmp_path):
     # the photo starts the shot, and re-anchors the last frame of each later segment
     assert [(i["frame"], i["strength"]) for i in job["images"]] == [(0, 1.0), (120, 0.6), (216, 0.6)]
     assert job["offload"] == "disk" and job["seed"] == 5
+    project.settings.loras = [{"path": "/loras/dual.safetensors", "strength": 1.0}]
+    assert TorchRunner(project, FAKE).job()["loras"] == [{"path": "/loras/dual.safetensors", "strength": 1.0}]
     project.settings.image_strength = 0.85  # a built scene: the model may repaint the first frame a little
     assert TorchRunner(project, FAKE).job()["images"][0]["strength"] == 0.85
 

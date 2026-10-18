@@ -19,7 +19,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from tdplay import __version__, engine, models, scene, worker
+from tdplay import __version__, engine, loras, models, scene, worker
 
 MAX_SEGMENTS = 20
 PROJECTS_DIR = models.HOME / "projects"
@@ -51,6 +51,13 @@ photo and placed on the location. *Left ↔ right* moves a character across, *Fe
 nearer the camera), *Size* is their height in the frame. Full-body photos work best for people who stand in the
 scene. *Name and outfit* goes into the Characters box above, which reminds the model in every segment what everyone
 wears. The first build downloads the cut-out model (180 MB).
+"""
+
+LORA_HELP = """
+LoRAs are add-ons that change how the model renders the whole shot. Pick up to four, each with a strength
+(0 = off): the two below, or your own LTX-2.3 LoRA files (from Civitai or Hugging Face, the kind ComfyUI uses).
+Most LoRAs were trained on LTX-2.3's full *dev* model and this app runs the faster *distilled* one, so if the picture
+gets noisy or burnt, lower the strength. The *distilled LoRA* itself isn't needed here.
 """
 
 RAM_GB = models.system_ram_gb()
@@ -220,6 +227,111 @@ def build_scene(location, *rest):
            "or move them with the sliders and build again.")
 
 
+NO_LORA = ("— none —", "")
+
+
+def lora_choices() -> list[tuple[str, str]]:
+    """The LoRAs to pick from: downloaded add-ons, the LoRA folder, and files added from elsewhere."""
+    return [NO_LORA, *loras.choices(load_prefs().get("lora_files", []))]
+
+
+def _lora_slots(picks, strengths=None, note=""):
+    """Updates for every LoRA slot (fresh choices) and the note below them."""
+    choices = lora_choices()
+    known = {path for _, path in choices}
+    out = [gr.update(choices=choices, value=pick if pick in known else "") for pick in picks]
+    out += [gr.skip() if strengths is None else strength for strength in (strengths or picks)]
+    return [*out, note]
+
+
+def _with_lora(picks, strengths, path):
+    """``path`` put into the first free slot (unless it is in one), at its suggested strength."""
+    picks, strengths = list(picks), list(strengths)
+    if path not in picks and "" in [p or "" for p in picks]:
+        slot = [p or "" for p in picks].index("")
+        picks[slot], strengths[slot] = path, loras.suggested_strength(path)
+    return picks, strengths
+
+
+def saved_loras():
+    """The LoRA slots as they were last set."""
+    saved = load_prefs().get("loras", [])
+    items = [saved[i] if i < len(saved) else {} for i in range(loras.MAX_LORAS)]
+    return _lora_slots([item.get("path", "") for item in items],
+                       [float(item.get("strength", 1.0)) for item in items])[:-1]
+
+
+def remember_loras(*values) -> None:
+    n = loras.MAX_LORAS
+    save_pref("loras", [{"path": p or "", "strength": float(s)} for p, s in zip(values[:n], values[n:])])
+
+
+def picked_lora(path):
+    """A LoRA was picked in a slot: start it at its suggested strength and say what's in the file."""
+    if not path:
+        return gr.skip(), ""
+    return loras.suggested_strength(path), f"**{Path(path).name}**: {loras.inspect(path).describe()}"
+
+
+def download_addon(index: int, *values):
+    """Download one of the app's known add-ons, then put it into a free slot."""
+    addon, n = loras.ADDONS[index], loras.MAX_LORAS
+    picks, strengths = values[:n], values[n:]
+    _state["downloading"] = True
+    try:
+        started = time.time()
+        for progress in models.download(addon.repo, (addon.file,)):
+            yield [*([gr.skip()] * 2 * n), f"Downloading **{addon.name}**: {models.wait_message(progress, started)}"]
+    except Exception as exc:
+        yield [*([gr.skip()] * 2 * n), f"⚠️ Downloading {addon.name} failed ({type(exc).__name__}: {exc}). "
+                                       "Press the button again: it continues where it stopped."]
+        return
+    finally:
+        _state["downloading"] = False
+    picks, strengths = _with_lora(picks, strengths, str(addon.path))
+    yield _lora_slots(picks, strengths, f"**{addon.name}** is ready: {addon.what}.")
+
+
+def addon_downloader(index: int):
+    """A click handler that downloads add-on ``index`` (a generator, so the progress shows)."""
+    def download(*values):
+        yield from download_addon(index, *values)
+
+    return download
+
+
+def add_lora_file(*values):
+    """Add a LoRA file from anywhere on the computer (the app window's file picker)."""
+    n = loras.MAX_LORAS
+    picks, strengths = values[:n], values[n:]
+    try:
+        import webview
+
+        window = webview.windows[0] if webview.windows else None
+    except ImportError:
+        window = None
+    if window is None:
+        return [*([gr.skip()] * 2 * n), "Copy the LoRA's `.safetensors` file into the LoRA folder (**Open the LoRA "
+                                        "folder**), then press **Refresh the list**."]
+    chosen = window.create_file_dialog(webview.FileDialog.OPEN, file_types=("LoRA files (*.safetensors)",))
+    if not chosen:
+        return [*([gr.skip()] * 2 * n), ""]
+    path = str(Path(chosen[0] if isinstance(chosen, (list, tuple)) else chosen))
+    info = loras.inspect(path)
+    if info.problem:
+        return [*([gr.skip()] * 2 * n), info.problem]
+    files = load_prefs().get("lora_files", [])
+    if path not in files:
+        save_pref("lora_files", [*files, path])
+    picks, strengths = _with_lora(picks, strengths, path)
+    return _lora_slots(picks, strengths, f"Added **{Path(path).name}**: {info.describe()}")
+
+
+def open_lora_folder() -> None:
+    loras.folder().mkdir(parents=True, exist_ok=True)
+    open_folder(str(loras.folder()))
+
+
 def status_html(title: str, fraction: float | None = None, detail: str = "", tone: str = "info") -> str:
     bar = ""
     if fraction is not None:
@@ -332,7 +444,17 @@ def _watch(project_dir: str, proc=None, resume_hint: bool = True):
 def generate(image, start_video, characters, n, *rest):
     prompts, seconds = rest[:MAX_SEGMENTS], rest[MAX_SEGMENTS : 2 * MAX_SEGMENTS]
     (preset_key, quality, aspect, low_ram, fast_math, watchdog, anchor, seam, color_lock, seed, out_size,
-     up_quality, image_strength) = rest[2 * MAX_SEGMENTS :]
+     up_quality, image_strength) = rest[2 * MAX_SEGMENTS : 2 * MAX_SEGMENTS + 13]
+    lora_values = rest[2 * MAX_SEGMENTS + 13 :]
+    chosen = [] if ON_MAC else [
+        {"path": path, "strength": float(strength)}
+        for path, strength in zip(lora_values[:loras.MAX_LORAS], lora_values[loras.MAX_LORAS:])
+        if path and float(strength) > 0]
+    for lora in chosen:
+        if problem := (loras.inspect(lora["path"]).problem if Path(lora["path"]).is_file()
+                       else f"⚠️ The LoRA file {lora['path']} isn't there any more."):
+            yield status_html(problem.removeprefix("⚠️ "), tone="error"), None, gr.skip()
+            return
     n = int(n)
     if ON_MAC and not IS_APPLE_SILICON and not os.environ.get("TDPLAY_LTX_CMD"):
         yield (status_html("TDPlay AI Video Render needs a Mac with Apple Silicon (M1 or newer) to generate.",
@@ -354,6 +476,7 @@ def generate(image, start_video, characters, n, *rest):
         fast_math=bool(fast_math), seed=int(seed if seed is not None else -1), anchor_strength=float(anchor),
         seam_frames=int(seam), color_lock=bool(color_lock), gpu_watchdog_fix=bool(watchdog),
         upscale=out_size or "off", upscale_quality=up_quality or "fast", image_strength=float(image_strength),
+        loras=chosen,
     )
     segments = [engine.Segment(str(p or ""), int(s)) for p, s in zip(prompts[:n], seconds[:n])]
     try:
@@ -708,6 +831,23 @@ def build() -> gr.Blocks:
                             color_lock = gr.Checkbox(True, label="Color lock at seams", visible=ON_MAC,
                                                      info="Cancels the small color shift each continuation adds.")
                             seed = gr.Number(-1, precision=0, label="Seed (-1 = random)")
+                        with gr.Accordion("Add-ons (LoRAs)", open=False, visible=not ON_MAC):
+                            gr.Markdown(LORA_HELP)
+                            lora_picks, lora_strengths = [], []
+                            for i in range(loras.MAX_LORAS):
+                                with gr.Row():
+                                    lora_picks.append(gr.Dropdown(lora_choices(), value="", label=f"LoRA {i + 1}",
+                                                                  scale=4))
+                                    lora_strengths.append(gr.Slider(0, 1.5, value=1.0, step=0.05, label="Strength",
+                                                                    scale=2))
+                            with gr.Row():
+                                addon_btns = [gr.Button(f"Download {a.name} ({a.megabytes} MB): {a.what}", size="sm")
+                                              for a in loras.ADDONS]
+                            with gr.Row():
+                                add_lora_btn = gr.Button("Add a LoRA file…", size="sm")
+                                lora_folder_btn = gr.Button("Open the LoRA folder", size="sm")
+                                lora_refresh_btn = gr.Button("Refresh the list", size="sm")
+                            lora_note = gr.Markdown()
                         with gr.Row():
                             out_size = gr.Radio(OUTPUT_SIZES, value="off", label="Final output size",
                                                 info="1080p and 4K are made by AI upscaling (Real-ESRGAN) after "
@@ -804,8 +944,23 @@ def build() -> gr.Blocks:
         follow = dict(api_visibility="private", show_progress="hidden", concurrency_limit=None)
         go.click(generate,
                  [image, start_video, characters, n_segments, *prompts, *seconds, preset, quality, aspect, low_ram,
-                  fast_math, watchdog, anchor, seam, color_lock, seed, out_size, up_quality, image_strength],
+                  fast_math, watchdog, anchor, seam, color_lock, seed, out_size, up_quality, image_strength,
+                  *lora_picks, *lora_strengths],
                  outputs, **follow)
+        lora_slots = [*lora_picks, *lora_strengths]
+        for pick, strength in zip(lora_picks, lora_strengths):
+            pick.input(picked_lora, pick, [strength, lora_note], api_visibility="private", queue=False)
+        for control in lora_slots:
+            control.change(remember_loras, lora_slots, None, api_visibility="private", queue=False)
+        for i, button in enumerate(addon_btns):
+            button.click(addon_downloader(i), lora_slots, [*lora_slots, lora_note], api_visibility="private",
+                         show_progress="hidden")
+        add_lora_btn.click(add_lora_file, lora_slots, [*lora_slots, lora_note], api_visibility="private")
+        lora_folder_btn.click(open_lora_folder, None, None, api_visibility="private")
+        lora_refresh_btn.click(lambda *values: _lora_slots(values[:loras.MAX_LORAS]), lora_slots,
+                               [*lora_slots, lora_note], api_visibility="private", queue=False)
+        if not ON_MAC:
+            demo.load(saved_loras, None, lora_slots, api_visibility="private", queue=False)
         for picture in scene_pictures:
             picture.change(spread_characters, scene_pictures, scene_across, api_visibility="private", queue=False)
         scene_btn.click(build_scene, [scene_location, *scene_pictures, *scene_across, *scene_down, *scene_size,

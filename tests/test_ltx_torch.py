@@ -288,6 +288,115 @@ def test_streaming_keeps_resident_blocks_on_the_gpu(tmp_path, monkeypatch):
     assert counts == [1, 1, 1, 4, 4, 3], counts
 
 
+def test_a_lora_reaches_every_block_once_whether_resident_or_streamed(tmp_path, monkeypatch):
+    """LTX-2's streaming classes with a real LoRA file: W + strength * B @ A in every pass, never twice."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("ltx_core")
+    from ltx_core.block_streaming import builder, provider, source
+    from ltx_core.block_streaming.block_fetcher import BlockFetcher
+    from ltx_core.block_streaming.disk import DiskBlockReader, DiskTensorReader, LoraSource
+    from ltx_core.block_streaming.pool import BufferPool
+    from ltx_core.block_streaming.stream_sync import create_stream_sync
+    from ltx_core.block_streaming.wrapper import BlockStreamingWrapper
+    from ltx_core.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP, SDOps
+    from safetensors.torch import save_file
+
+    from tdplay import ltx_torch
+
+    for cls, name in ((provider.WeightsProvider, "get"), (source.DiskWeightSource, "get"),
+                      (builder.StreamingModelBuilder, "build")):
+        monkeypatch.setattr(cls, name, getattr(cls, name))
+    ltx_torch.keep_blocks_on_gpu()
+
+    n, resident, strength = 6, frozenset({0, 1, 2}), 0.8
+    weights = [torch.randn(4, 4) for _ in range(n)]
+    a, b = [torch.randn(2, 4) for _ in range(n)], [torch.randn(4, 2) for _ in range(n)]
+    path, lora = str(tmp_path / "blocks.safetensors"), str(tmp_path / "lora.safetensors")
+    # Each block has a named layer, like LTX-2's (attn1.to_q, ff.net.2...): LoRAs are fused into "<layer>.weight".
+    save_file({f"transformer_blocks.{i}.proj.weight": w for i, w in enumerate(weights)}, path)
+    save_file({**{f"diffusion_model.transformer_blocks.{i}.proj.lora_A.weight": x for i, x in enumerate(a)},
+               **{f"diffusion_model.transformer_blocks.{i}.proj.lora_B.weight": x for i, x in enumerate(b)}}, lora)
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4, bias=False)
+
+        def forward(self, x):
+            return self.proj(x)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer_blocks = torch.nn.ModuleList(Block() for _ in range(n))
+
+        def forward(self, x):
+            for block in self.transformer_blocks:
+                x = block(x)
+            return x
+
+    with torch.device("meta"):
+        model = Model()
+    blocks = model.transformer_blocks
+    key_map, _ = builder._scan_checkpoint_keys([path], SDOps("all").with_matching(), "transformer_blocks")
+    layouts = builder._block_layouts(blocks, key_map, torch.float32)
+    cpu, sync = torch.device("cpu"), create_stream_sync(torch.device("cpu"))
+    slot = 64
+    disk = source.DiskWeightSource(
+        BufferPool(slot, 4, cpu, reuse_barrier=sync.reuse_barrier),
+        BlockFetcher(DiskBlockReader(DiskTensorReader([path]), key_map, None, "transformer_blocks")),
+        layouts, blocks_number=n, prefetch_depth=2)
+    gpu = provider.WeightsProvider(BufferPool(slot, len(resident) + 2, cpu, reuse_barrier=sync.reuse_barrier),
+                                   sync, cpu, disk, [LoraSource(lora, LTXV_LORA_COMFY_RENAMING_MAP, strength)],
+                                   "transformer_blocks")
+    gpu.tdplay_resident = disk.tdplay_resident = resident
+    wrapper = BlockStreamingWrapper(model, blocks, gpu, cpu)
+
+    x = torch.randn(3, 4)
+    expected = x
+    for w, down, up in zip(weights, a, b, strict=True):
+        expected = expected @ (w + strength * up @ down).T
+    with torch.inference_mode():
+        for _ in range(3):  # resident blocks keep their fused weights, streamed ones are fused again each pass
+            assert torch.allclose(wrapper(x), expected, rtol=0.05, atol=0.05)
+    wrapper.teardown()
+
+
+def test_lora_changes_survive_rounding_to_fp8():
+    """A LoRA's change smaller than half an fp8 step: nearest rounding drops it, ours keeps it on average."""
+    torch = pytest.importorskip("torch")
+    from tdplay import ltx_torch
+
+    for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        values = torch.tensor([1.0, -1.0, 0.3, 200.0, 2.0**-6, 0.0, 447.0])
+        weight = values.repeat(50000, 1).to(dtype)
+        delta = torch.tensor([0.02, -0.02, 0.004, 5.0, -0.0001, 0.001, 3.0]).repeat(50000, 1).to(torch.bfloat16)
+        largest = 448.0 if dtype == torch.float8_e4m3fn else 57344.0
+        target = (weight.float() + delta.float()).clamp(-largest, largest).mean(0)
+        fused = ltx_torch.round_to_fp8_stochastically(delta.clone(), weight)
+        assert fused.dtype == dtype and fused.shape == weight.shape
+        # On average right: within 0.3%, or 2% for the tiniest values, whose fp8 steps are coarse next to them.
+        assert torch.allclose(fused.float().mean(0), target, rtol=0.003, atol=2e-5), (dtype, fused.float().mean(0))
+        nearest = (weight.float() + delta.float()).to(dtype).float().mean(0)
+        assert not torch.allclose(nearest, target, rtol=0.003)  # what LTX-2 does without Triton
+
+
+def test_loras_go_to_ltx2_with_comfyui_names_and_rounding(monkeypatch):
+    pytest.importorskip("ltx_core")
+    from ltx_core.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
+    from ltx_core.quantization import fp8_cast
+
+    from tdplay import ltx_torch
+
+    (lora,) = ltx_torch.lora_inputs({"loras": [{"path": "/x/dual.safetensors", "strength": 0.7}]})
+    assert (lora.path, lora.strength, lora.sd_ops) == ("/x/dual.safetensors", 0.7, LTXV_LORA_COMFY_RENAMING_MAP)
+    assert ltx_torch.lora_inputs({}) == ()
+    monkeypatch.setattr(fp8_cast, "fuse_cast_fp8_weight", fp8_cast.fuse_cast_fp8_weight)
+    ltx_torch.fuse_loras_with_stochastic_rounding()
+    ltx_torch.fuse_loras_with_stochastic_rounding()  # once is enough
+    assert fp8_cast.fuse_cast_fp8_weight.tdplay
+
+
 @pytest.fixture
 def fake_gpu(monkeypatch):
     """The build glue around a fake 24 GB card: LTX-2's build replaced, torch.cuda's memory queries faked."""

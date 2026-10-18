@@ -89,7 +89,7 @@ class TorchRunner(Runner):
             "seam_frames": s.seam_frames, "color_lock": s.color_lock,
             "checkpoint": find_checkpoint(s.model_dir) if s.model_dir else "",
             "gemma_root": s.gemma_dir, "upsampler": s.upsampler, "offload": s.offload,
-            "gpu_memory": s.gpu_memory,
+            "gpu_memory": s.gpu_memory, "loras": [dict(lora) for lora in s.loras],
         }
 
     def _start_files(self) -> tuple[Path | None, Path]:
