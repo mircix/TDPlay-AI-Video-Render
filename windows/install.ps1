@@ -36,6 +36,13 @@ $FfmpegUrl = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essential
 $FfmpegSha256 = "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec"
 
 function Say([string]$Text) { Write-Host ""; Write-Host $Text -ForegroundColor Cyan }
+function Get-ErrorText($Record) {
+    # The message of an error and of the errors inside it ("cannot be started" alone doesn't say why).
+    $parts = @(); $e = $Record.Exception
+    while ($e) { $parts += $e.Message; $e = $e.InnerException }
+    ($parts | Select-Object -Unique) -join " "
+}
+
 function Fail([string]$Text) {
     Write-Host ""; Write-Host $Text -ForegroundColor Red
     if (-not $NoPause) { Read-Host "Press Enter to close" | Out-Null }
@@ -79,13 +86,23 @@ function Get-GpuTarget([string[]]$Names) {
 if ($DefineOnly) { return }
 
 # Any error that stops the script (a failed download, a full disk...) ends here, with the message.
-trap { Fail ("The setup stopped: " + $_.Exception.Message) }
+trap { Fail ("The setup stopped: " + (Get-ErrorText $_)) }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 # A log next to the app, for when the window closed too fast to read (PowerShell 5.1 leaves out
 # the output of programs like pip here; the steps and any error are in it).
-Start-Transcript -Path (Join-Path $Root "setup.log") -Force | Out-Null
+# The log is only a help: if setup.log can't be opened (another setup window still has it, say), use
+# one in TEMP, and if that fails too, carry on without.
+$logFile = Join-Path $Root "setup.log"
+try { Start-Transcript -Path $logFile -Force | Out-Null }
+catch {
+    $why = Get-ErrorText $_
+    $logFile = Join-Path $env:TEMP "tdplay-setup.log"
+    try { Start-Transcript -Path $logFile -Force | Out-Null; Write-Host "(setup.log is in use: $why)" }
+    catch { $logFile = $null; Write-Host "(No setup log: $why)" -ForegroundColor DarkGray }
+}
 Say "TDPlay AI Video Render setup"
+if ($logFile) { Write-Host "Log: $logFile" }
 try { $Host.UI.RawUI.WindowTitle = "TDPlay AI Video Render setup - keep this window open" } catch { }
 Write-Host "Keep this window open: it closes by itself when the setup is done. The downloads take a while." -ForegroundColor Yellow
 Write-Host ("Options: " + (($PSBoundParameters.Keys | ForEach-Object { "-$_" }) -join " "))
