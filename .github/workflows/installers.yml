@@ -1,13 +1,18 @@
 # Builds the Mac disk image and the Windows installer, installs each one the way a user would, checks
 # that the installed app works (a short render with a stand-in model; the runners have no usable GPU
-# for the real one), and publishes both on a GitHub release when a v* tag is pushed. The installers go
-# straight onto a draft release (no workflow artifacts), which is published once both jobs passed.
+# for the real one), and publishes both on a GitHub release.
+#
+# Releasing: change __version__ in tdplay/__init__.py and push to main (or push a v* tag). If that
+# version has no release yet, the installers go onto a draft release (no workflow artifacts), which
+# is published, with its tag, once both passed. "Run workflow" builds and tests without releasing.
 name: Installers
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:   # "Run workflow" on GitHub: build and test both installers without releasing
+    branches: [main]
+    paths: ["tdplay/__init__.py", ".github/workflows/installers.yml"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -18,22 +23,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  draft:
-    name: Draft the release
-    if: startsWith(github.ref, 'refs/tags/v')
+  plan:
+    name: Plan the release
     runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      tag: ${{ steps.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
-      - env:
+      - id: plan
+        env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" --draft --verify-tag \
-            --title "TDPlay AI Video Render ${GITHUB_REF_NAME#v}" --notes-file .github/release-notes.md
+          version="$(python3 -c 'import re; print(re.search(r"__version__ = \"(.+?)\"", open("tdplay/__init__.py").read()).group(1))')"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then tag="${GITHUB_REF_NAME}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then tag="v${version}"
+          else tag=""; fi  # "Run workflow": build and test only
+          build=true
+          if [[ -n "${tag}" ]] && [[ "$(gh release view "${tag}" --json isDraft --jq .isDraft 2>/dev/null)" == "false" ]]; then
+            echo "${tag} is already released: nothing to do."
+            build=false
+            tag=""
+          elif [[ -n "${tag}" ]] && ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create "${tag}" --draft --target "${GITHUB_SHA}" \
+              --title "TDPlay AI Video Render ${tag#v}" --notes-file .github/release-notes.md
+          fi
+          echo "Release: ${tag:-none}"
+          echo "build=${build}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
 
   macos:
     name: Mac disk image
-    needs: [draft]
-    if: ${{ !cancelled() && needs.draft.result != 'failure' }}
+    needs: [plan]
+    if: needs.plan.outputs.build == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -72,15 +94,16 @@ jobs:
         run: python3 .github/annotate.py macOS "${HOME}/TDPlay/logs/setup.log" smoke.log pytest.log
 
       - name: Add the disk image to the draft release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.plan.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" dist/*.dmg --clobber
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: gh release upload "${TAG}" dist/*.dmg --clobber
 
   windows:
     name: Windows installer
-    needs: [draft]
-    if: ${{ !cancelled() && needs.draft.result != 'failure' }}
+    needs: [plan]
+    if: needs.plan.outputs.build == 'true'
     runs-on: windows-2025
     timeout-minutes: 90
     defaults:
@@ -148,17 +171,19 @@ jobs:
         run: python .github/annotate.py Windows installer-setup.log setup.log smoke.log pytest.log install.log
 
       - name: Add Setup.exe to the draft release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.plan.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload $env:GITHUB_REF_NAME (Get-ChildItem dist\TDPlay-AI-Video-Render-Setup-*.exe).FullName --clobber
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: gh release upload $env:TAG (Get-ChildItem dist\TDPlay-AI-Video-Render-Setup-*.exe).FullName --clobber
 
   release:
     name: Publish the release
-    needs: [macos, windows]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [plan, macos, windows]
+    if: needs.plan.outputs.tag != ''
     runs-on: ubuntu-latest
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest

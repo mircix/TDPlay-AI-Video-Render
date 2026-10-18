@@ -315,7 +315,9 @@ reopening onto a running job.
 `iscc /DAppVersion=1.2.0 windows\installer\TDPlay.iss` the Windows Setup.exe ([Inno Setup 6](https://jrsoftware.org/isinfo.php)).
 The *Installers* GitHub workflow (`.github/workflows/installers.yml`) builds both, installs each one the way a user
 would (the Windows one with CPU PyTorch, as the runner has no GPU), runs `tests/smoke_installed.py` and the test
-suite against the installed packages, and publishes both on a release when a `v*` tag is pushed.
+suite against the installed packages. **Releasing:** change `__version__` in `tdplay/__init__.py` and push to `main`
+(or push a `v*` tag): if that version has no release yet, the workflow publishes one with both installers once
+everything passed. *Run workflow* on GitHub builds and tests them without releasing.
 
 Layout: `tdplay/engine.py` (Mac segment chaining, joins, resume) · `tdplay/engine_torch.py` and
 `tdplay/ltx_torch.py` (Windows: the whole shot as one LTX-2 run) · `tdplay/media.py` (ffmpeg I/O) ·
