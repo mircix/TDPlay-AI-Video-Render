@@ -102,3 +102,48 @@ def test_weights_are_read_without_mapping_the_files(tmp_path, monkeypatch):
     loaded = SafetensorsStateDictLoader().load(str(path), None, torch.device("cpu"))
     assert backends == ["pread"]
     assert loaded.sd["a.weight"].float().sum().item() == 15
+
+
+def test_lightricks_fp8_checkpoint_streams_from_disk(tmp_path, monkeypatch):
+    """Low-RAM mode streams blocks from disk; the fp8 checkpoint's *_scale tensors must not stop it."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("ltx_core")
+    from ltx_core.block_streaming import builder
+    from ltx_core.block_streaming.disk import DiskBlockReader, DiskTensorReader
+    from ltx_core.loader.sd_ops import SDOps
+    from ltx_core.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
+    from ltx_core.quantization.fp8_cast import build_policy
+    from safetensors.torch import save_file
+
+    from tdplay.ltx_torch import stream_without_scale_keys
+
+    # Laid out like ltx-2.3-22b-distilled-fp8: bf16 blocks, and 8-bit blocks whose Linears carry a
+    # weight_scale and an input_scale. The values are exact in fp8, so the check can be exact too.
+    w = torch.tensor([[0.5, 1.0, 1.5, 2.0]] * 4)
+    p = "model.diffusion_model.transformer_blocks."
+    tensors = {p + "0.attn1.to_q.weight": w.to(torch.bfloat16), "model.diffusion_model.proj_out.weight": w}
+    for layer in ("attn1.to_q", "attn1.to_gate_logits"):
+        tensors[f"{p}1.{layer}.weight"] = (w / 2).to(torch.float8_e4m3fn)
+        tensors[f"{p}1.{layer}.weight_scale"] = torch.tensor(2.0)
+        tensors[f"{p}1.{layer}.input_scale"] = torch.tensor(0.25)
+    path = str(tmp_path / "ltx-fp8.safetensors")
+    save_file(tensors, path)
+    policy = build_policy(path)
+    sd_ops = SDOps("chain", mapping=(*LTXV_MODEL_COMFY_RENAMING_MAP.mapping, *policy.sd_ops.mapping))
+
+    monkeypatch.setattr(builder, "_scan_checkpoint_keys", builder._scan_checkpoint_keys)  # undone after the test
+    blocks, _ = builder._scan_checkpoint_keys([path], sd_ops, "transformer_blocks")
+    assert any(name.endswith("input_scale") for _, name in blocks[1])  # what made LTX-2 1.4.2 stop
+
+    stream_without_scale_keys()
+    stream_without_scale_keys()  # a second call doesn't wrap twice
+    blocks, non_block = builder._scan_checkpoint_keys([path], sd_ops, "transformer_blocks")
+    assert sorted(name for _, name in blocks[1]) == ["attn1.to_gate_logits.weight", "attn1.to_q.weight"]
+    assert [name for _, name in non_block] == ["proj_out.weight"]
+
+    # LTX-2's own disk reader then fills block 1, with the weight scales folded in.
+    target = {"attn1.to_q.weight": torch.empty(4, 4, dtype=torch.float8_e4m3fn),  # stays 8-bit
+              "attn1.to_gate_logits.weight": torch.empty(4, 4, dtype=torch.bfloat16)}  # upcast to bf16
+    DiskBlockReader(DiskTensorReader([path]), blocks, sd_ops, "transformer_blocks").read_into(target, 1)
+    for value in target.values():
+        assert torch.equal(value.float(), w)

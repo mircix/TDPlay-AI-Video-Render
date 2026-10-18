@@ -167,6 +167,36 @@ def read_weights_without_mapping() -> None:
     safetensors.safe_open = safe_open
 
 
+#: Prequantized-weight scales stored next to the 8-bit Linears in Lightricks' fp8 checkpoint.
+SCALE_KEY_SUFFIXES = (".weight_scale", ".bias_scale", ".input_scale")
+
+
+def stream_without_scale_keys() -> None:
+    """Let LTX-2 stream its 8-bit checkpoint from disk: keep the ``*_scale`` tensors out of the block plan.
+
+    Lightricks' fp8 checkpoint stores a ``weight_scale`` and an ``input_scale`` next to each 8-bit
+    Linear. The fp8-cast policy folds the weight scales into the weights from a table it reads up
+    front (``fp8_cast._read_scales``) and has no use for activation scales, but LTX-2 1.4.2's
+    streaming builder plans every checkpoint key as a block parameter and stops with
+    ``KeyError: 'attn1.to_gate_logits.input_scale'`` (Low-RAM mode streams from disk).
+    """
+    from ltx_core.block_streaming import builder
+
+    if getattr(builder._scan_checkpoint_keys, "tdplay", False):
+        return
+    scan = builder._scan_checkpoint_keys
+
+    def scan_without_scales(checkpoint_paths, sd_ops, blocks_prefix):
+        block_key_map, non_block_keys = scan(checkpoint_paths, sd_ops, blocks_prefix)
+        block_key_map = {idx: [(key, name) for key, name in entries if not key.endswith(SCALE_KEY_SUFFIXES)]
+                         for idx, entries in block_key_map.items()}
+        non_block_keys = [(key, name) for key, name in non_block_keys if not key.endswith(SCALE_KEY_SUFFIXES)]
+        return block_key_map, non_block_keys
+
+    scan_without_scales.tdplay = True
+    builder._scan_checkpoint_keys = scan_without_scales
+
+
 def render(job: dict) -> None:
     import torch
     from ltx_core.quantization.fp8_cast import build_policy
@@ -176,6 +206,7 @@ def render(job: dict) -> None:
     from tdplay import media
 
     read_weights_without_mapping()
+    stream_without_scale_keys()
     out_dir = Path(job["chunks_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     fps = int(job["fps"])
