@@ -181,7 +181,9 @@ go back to Balanced if the screen flickers or goes black. 704p (1280×704) is wo
   segment.
 * **Resume starts the shot over.** The carry between segments lives inside the model run, so a stopped shot is
   rendered again from the beginning (with the same seed).
-* **No "continue a video you already have"** yet. A start photo works.
+* **"Continue a video you already have"** pins your clip's last second (picture and sound) at the start of the first
+  segment, the same way each segment carries into the next, and blends the model's version of that second back into
+  your original frames. Your clip comes first in the result, unchanged.
 * **1080p / 4K upscaling** works the same way, with Real-ESRGAN on the GPU through PyTorch.
 * **Speed is not measured yet.** Your first run is the benchmark; the log shows every step.
 

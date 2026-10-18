@@ -6,6 +6,11 @@ the next chunk, and LTX-2 cross-fades the decoded overlap. TDPlay only adds what
 pipeline lacks for this: one prompt per chunk, and chunk lengths that follow the segment lengths.
 This is the same continuation the Mac version does, segment by segment, with ``extend --distilled``.
 
+A shot can continue the user's own video (``start_tail`` in the job: its last 25 frames, with sound).
+Those are encoded with LTX-2's video and audio encoders and pinned at the start of the first chunk,
+the way a chunk's carry is pinned at the start of the next one. The first 25 decoded frames are
+then the model's re-decode of the user's frames: they are cross-faded back into the originals.
+
 The model is LTX-2.3 distilled in 8-bit (``fp8-cast``: weights stored in fp8, upcast during compute,
 which works on GPUs without fp8 hardware), with the Gemma 3 text encoder. Weights stream from RAM
 or from disk (``--offload``), so it fits a 24 GB card.
@@ -67,26 +72,81 @@ def _pipeline_class():
     """Defined lazily so this module imports without torch (the plan helpers above are tested on their own)."""
     import ltx_pipelines.distilled as D
     import torch
+    from ltx_core.conditioning.types.latent_cond import AudioConditionByLatentIndex, VideoConditionByLatentIndex
     from ltx_pipelines.chunks.layout import ChunkLayout
-    from ltx_pipelines.utils.helpers import create_initial_av_latents
+    from ltx_pipelines.utils.blocks import AudioConditioner
+    from ltx_pipelines.utils.helpers import audio_latent_from_file, create_initial_av_latents, video_latent_from_file
 
     class SegmentedDistilledPipeline(D.DistilledPipeline):
         """``DistilledPipeline.stream_chunks`` with one prompt and one length per chunk."""
 
-        def segment_chunks(self, layouts, contexts, target, dtype, make_video_conditionings) -> Iterator:
+        class StartVideo:
+            """The user's video a shot continues: its last frames and sound, pinned at the start of chunk 0.
+
+            Encoded when chunk 0 is denoised, once per pass (the draft runs at half resolution, the refine at
+            full), as ``VideoConditionByLatentIndex`` / ``AudioConditionByLatentIndex`` at latent index 0:
+            what ``denoise_chunks`` pins for a carry from a previous chunk.
+            """
+
+            def __init__(self, pipeline, path: str, fps: float, with_audio: bool):
+                self.pipeline, self.path, self.fps, self.with_audio = pipeline, path, fps, with_audio
+                self._video: dict[tuple[int, int], torch.Tensor] = {}
+                self._audio: list = []
+
+            def shape(self, height: int = 32, width: int = 32):
+                return D.VideoPixelShape(batch=1, frames=CARRY_FRAMES, height=height, width=width, fps=self.fps)
+
+            def video_conditionings(self, make):
+                def conditionings(chunk) -> list:
+                    items = list(make(chunk))
+                    if chunk.video is None:
+                        return items
+                    size = tuple(chunk.video.shape[3:])
+                    if size not in self._video:
+                        scale = self.pipeline.stage.video_scale_factors
+                        shape = self.shape(size[0] * scale.height, size[1] * scale.width)
+                        self._video[size] = self.pipeline.image_conditioner(lambda enc: video_latent_from_file(
+                            video_encoder=enc, file_path=self.path, output_shape=shape,
+                            device=self.pipeline.device, dtype=chunk.video.dtype))
+                    pinned = VideoConditionByLatentIndex(latent=self._video[size], strength=1.0, latent_idx=0)
+                    return [*items, pinned]
+
+                return conditionings
+
+            def audio_conditionings(self, chunk) -> list:
+                if not self.with_audio or chunk.audio is None:  # a silent video: the prompt makes the sound
+                    return []
+                if not self._audio:
+                    self._audio.append(self.pipeline.audio_conditioner(lambda enc: audio_latent_from_file(
+                        audio_encoder=enc, file_path=self.path, output_shape=self.shape(),
+                        device=self.pipeline.device, dtype=chunk.audio.dtype)))
+                latent = self._audio[0]  # None if the file has no sound track
+                return [] if latent is None else [AudioConditionByLatentIndex(latent, strength=1.0, latent_idx=0)]
+
+        def __init__(self, *args, model_paths, **kwargs):
+            super().__init__(*args, model_paths=model_paths, **kwargs)
+            # The audio encoder (built only when a start video's sound is encoded).
+            self.audio_conditioner = AudioConditioner(model_paths.audio_vae(), self.dtype, self.device)
+
+        def segment_chunks(self, layouts, contexts, target, dtype, make_video_conditionings,
+                           start: SegmentedDistilledPipeline.StartVideo | None = None) -> Iterator:
             for i, (layout, ctx) in enumerate(zip(layouts, contexts, strict=True)):
                 print(f"SEGMENT {i + 1}/{len(layouts)}", flush=True)
                 video, audio = create_initial_av_latents(
                     width=target.width, height=target.height, frames=layout.pixel_frames, fps=target.fps,
                     device=self.device, dtype=dtype, video_scale_factors=self.stage.video_scale_factors,
                 )
+                factories = {"make_video_conditionings": make_video_conditionings}
+                if start is not None and i == 0:
+                    factories = {"make_video_conditionings": start.video_conditionings(make_video_conditionings),
+                                 "make_audio_conditionings": start.audio_conditionings}
                 yield D.Chunk(
                     layout=layout, video=video, audio=audio,
-                    video_context=ctx.video_encoding, audio_context=ctx.audio_encoding,
-                    make_video_conditionings=make_video_conditionings,
+                    video_context=ctx.video_encoding, audio_context=ctx.audio_encoding, **factories,
                 )
 
-        def stream_segments(self, *, prompts, first_frames, new_frames, seed, height, width, frame_rate, images):
+        def stream_segments(self, *, prompts, first_frames, new_frames, seed, height, width, frame_rate, images,
+                            start_tail: str | None = None, start_audio: bool = False):
             layouts = [ChunkLayout(**spec) for spec in plan_frames(first_frames, new_frames)]
             total = sum(layout.pixel_frames - layout.prev_video_carry_frames for layout in layouts)
 
@@ -109,8 +169,9 @@ def _pipeline_class():
 
             target = D.VideoPixelShape(batch=1, frames=ctx.num_frames, height=ctx.stage_1_height,
                                        width=ctx.stage_1_width, fps=frame_rate)
+            start = self.StartVideo(self, start_tail, frame_rate, start_audio) if start_tail else None
             chunks = self.segment_chunks(layouts, contexts, target, ctx.dtype,
-                                         self._video_conditionings(ctx.images, ctx.num_frames, None))
+                                         self._video_conditionings(ctx.images, ctx.num_frames, None), start)
             stage_1 = D.DISTILLED_SIGMAS.to(dtype=torch.float32, device=self.device)
             stage_2 = D.STAGE_2_DISTILLED_SIGMAS.to(dtype=torch.float32, device=self.device)
             base = D.denoise_chunks(chunks, GpuPass(self.stage, "draft"), sigmas=stage_1, noiser=ctx.noiser,
@@ -147,6 +208,39 @@ def _to_numpy(piece, fps: int):
 
         wave = torchaudio.functional.resample(wave, piece.audio.sampling_rate, media.SAMPLE_RATE)
     return frames, media.fit_audio(wave.T.contiguous().numpy(), samples)
+
+
+def continue_start_video(pieces, tail_path: str, *, fps: int, width: int, height: int, seam_frames: int,
+                         color_lock: bool):
+    """Decoded pieces of a shot that continues the user's video, with the seam blended in.
+
+    The first ``CARRY_FRAMES`` decoded frames are the model's re-decode of the video's last frames.
+    They are replaced by the originals, cross-faded into the re-decode over the last ``seam_frames``
+    (``tdplay.engine.splice``, as on the Mac). With ``color_lock``, all new frames get the color
+    correction measured on them, so no seam shows where one piece meets the next either.
+    """
+    import numpy as np
+
+    from tdplay import engine, media
+
+    tail = media.read_frames(tail_path, width, height)
+    tail_audio = media.fit_audio(media.read_audio(tail_path), media.samples_for_frames(len(tail), fps))
+    pieces = iter(pieces)
+    held = []
+    for piece in pieces:  # the first piece can be shorter than the re-decoded frames: gather enough
+        held.append(piece)
+        if sum(len(frames) for frames, _ in held) > len(tail):
+            break
+    out = np.concatenate([frames for frames, _ in held])
+    if len(out) <= len(tail):
+        raise RuntimeError(f"The model returned {len(out)} frames, expected more than {len(tail)}.")
+    luts = engine.color_lock_luts(tail, out[:len(tail)]) if color_lock else None
+    yield engine.splice((tail, tail_audio), out, np.concatenate([audio for _, audio in held]), fps=fps,
+                        seam_frames=seam_frames, luts=luts)
+    for frames, audio in pieces:
+        if luts is not None:
+            engine.apply_luts(frames, luts)
+        yield frames, audio
 
 
 def read_weights_without_mapping() -> None:
@@ -435,8 +529,6 @@ def render(job: dict) -> None:
     from ltx_pipelines.utils.model_paths import ModelPaths
     from ltx_pipelines.utils.types import ImageConditioningInput, OffloadMode
 
-    from tdplay import media
-
     read_weights_without_mapping()
     stream_without_scale_keys()
     limit_gpu_memory(job.get("gpu_memory", "balanced"))
@@ -461,18 +553,32 @@ def render(job: dict) -> None:
         decoded, total = pipeline.stream_segments(
             prompts=job["prompts"], first_frames=int(job["first_frames"]), new_frames=[int(f) for f in job["new_frames"]],
             seed=int(job["seed"]), height=int(job["height"]), width=int(job["width"]), frame_rate=float(fps),
-            images=images,
+            images=images, start_tail=job.get("start_tail"), start_audio=bool(job.get("start_tail_audio")),
         )
-        done = 0
-        for k, piece in enumerate(decoded):
-            frames, audio = _to_numpy(piece, fps)
-            tmp_v, tmp_a = out_dir / f"piece_{k:03d}.tmp.mp4", out_dir / f"piece_{k:03d}.tmp.wav"
-            media.write_video(tmp_v, frames, fps)
-            media.write_wav(tmp_a, audio)
-            tmp_v.replace(out_dir / f"piece_{k:03d}.mp4")
-            tmp_a.replace(out_dir / f"piece_{k:03d}.wav")
-            done += len(frames)
-            print(f"FRAMES {done}/{total}", flush=True)
+        write_pieces((_to_numpy(piece, fps) for piece in decoded), job, total)
+
+
+def write_pieces(pieces, job: dict, total: int) -> None:
+    """Write decoded ``(frames, audio)`` pieces as ``chunks/piece_NNN.mp4`` + ``.wav``, printing ``FRAMES``.
+
+    A shot that continues a start video gets its seam blended in first (:func:`continue_start_video`).
+    """
+    from tdplay import media
+
+    fps, out_dir = int(job["fps"]), Path(job["chunks_dir"])
+    if job.get("start_tail"):
+        pieces = continue_start_video(pieces, job["start_tail"], fps=fps, width=int(job["width"]),
+                                      height=int(job["height"]), seam_frames=int(job.get("seam_frames", 8)),
+                                      color_lock=bool(job.get("color_lock", True)))
+    done = 0
+    for k, (frames, audio) in enumerate(pieces):
+        tmp_v, tmp_a = out_dir / f"piece_{k:03d}.tmp.mp4", out_dir / f"piece_{k:03d}.tmp.wav"
+        media.write_video(tmp_v, frames, fps)
+        media.write_wav(tmp_a, audio)
+        tmp_v.replace(out_dir / f"piece_{k:03d}.mp4")
+        tmp_a.replace(out_dir / f"piece_{k:03d}.wav")
+        done += len(frames)
+        print(f"FRAMES {done}/{total}", flush=True)
 
 
 def main(argv: list[str] | None = None) -> None:

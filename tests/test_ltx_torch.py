@@ -43,6 +43,59 @@ def test_plan_is_valid_for_ltx_pipelines_and_chunks_get_their_own_prompt():
     assert all(c.audio is not None for c in chunks)
 
 
+def test_a_start_video_is_pinned_at_the_start_of_the_first_chunk(monkeypatch):
+    """Its last second, encoded at each pass's resolution, is what LTX-2 pins for a carry; its sound too."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("ltx_pipelines")
+    from dataclasses import replace
+
+    import ltx_pipelines.utils.helpers as helpers
+    from ltx_core.conditioning.types.latent_cond import AudioConditionByLatentIndex, VideoConditionByLatentIndex
+    from ltx_core.types import VIDEO_SCALE_FACTORS
+    from ltx_pipelines.chunks.layout import ChunkLayout
+    from ltx_pipelines.distilled import VideoPixelShape
+
+    encoded = []
+
+    def video_latent_from_file(video_encoder, file_path, output_shape, device, dtype):
+        assert video_encoder == "video encoder"
+        encoded.append(("video", file_path, output_shape.frames, output_shape.height, output_shape.width))
+        return torch.zeros(1, 128, 4, output_shape.height // 32, output_shape.width // 32)
+
+    def audio_latent_from_file(audio_encoder, file_path, output_shape, device, dtype):
+        assert audio_encoder == "audio encoder"
+        encoded.append(("audio", file_path, output_shape.frames))
+        return torch.zeros(1, 8, 7, 16)
+
+    monkeypatch.setattr(helpers, "video_latent_from_file", video_latent_from_file)
+    monkeypatch.setattr(helpers, "audio_latent_from_file", audio_latent_from_file)
+    cls = ltx_torch._pipeline_class()
+    pipe = object.__new__(cls)
+    pipe.device = torch.device("cpu")
+    pipe.stage = SimpleNamespace(video_scale_factors=VIDEO_SCALE_FACTORS)
+    pipe.image_conditioner = lambda fn: fn("video encoder")
+    pipe.audio_conditioner = lambda fn: fn("audio encoder")
+    layouts = [ChunkLayout(**spec) for spec in ltx_torch.plan_frames(25 + 48, [48])]
+    contexts = [SimpleNamespace(video_encoding=torch.zeros(1), audio_encoding=torch.zeros(1))] * 2
+    target = VideoPixelShape(batch=1, frames=121, height=128, width=192, fps=24.0)
+    start = cls.StartVideo(pipe, "start_tail.mp4", 24.0, with_audio=True)
+    first, second = pipe.segment_chunks(layouts, contexts, target, torch.bfloat16, lambda chunk: ["photo"], start)
+
+    photo, pinned = first.make_video_conditionings(first)
+    assert photo == "photo" and isinstance(pinned, VideoConditionByLatentIndex)
+    assert (pinned.latent_idx, pinned.strength, pinned.latent.shape[2:]) == (0, 1.0, (4, 4, 6))
+    (sound,) = first.make_audio_conditionings(first)
+    assert isinstance(sound, AudioConditionByLatentIndex) and sound.latent_idx == 0
+    assert second.make_video_conditionings(second) == ["photo"] and second.make_audio_conditionings(second) == []
+    # The draft pass reuses its encoding; the refine pass (full resolution) gets its own.
+    first.make_video_conditionings(first)
+    full = replace(first, video=torch.zeros(1, 128, 10, 8, 12))
+    assert full.make_video_conditionings(full)[1].latent.shape[3:] == (8, 12)
+    assert encoded == [("video", "start_tail.mp4", 25, 128, 192), ("audio", "start_tail.mp4", 25),
+                       ("video", "start_tail.mp4", 25, 256, 384)]
+    assert cls.StartVideo(pipe, "start_tail.mp4", 24.0, with_audio=False).audio_conditionings(first) == []
+
+
 def test_prompts_are_encoded_once_and_the_first_reaches_prepare_run():
     torch = pytest.importorskip("torch")
     pytest.importorskip("ltx_pipelines")

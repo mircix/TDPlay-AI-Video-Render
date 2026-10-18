@@ -5,7 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
+import fake_ltx
+import numpy as np
 
 from tdplay import engine, media
 from tdplay.engine import Segment
@@ -73,6 +74,54 @@ def test_upscale_after_the_shot(tmp_path):
     assert (media.probe(events[-1].path).width, media.probe(events[-1].path).height) == (3840, 2160)
 
 
-def test_continuing_a_video_is_mac_only(tmp_path):
-    with pytest.raises(ValueError, match="Windows"):
-        engine.create_project(tmp_path / "p", torch_settings(tmp_path), [Segment("a", 2)], start_video="x.mp4")
+def start_video(tmp_path: Path, frames: int = 60, sound: bool = True) -> str:
+    """A clip of your own: numbered frames 0.., with the matching tone (or silence)."""
+    path = tmp_path / "mine.mp4"
+    base = fake_ltx.base_color(3)
+    audio = fake_ltx.tone(0, frames, 24) * (1 if sound else 0)
+    fake_ltx.write(str(path), np.stack([fake_ltx.render(i, W, H, base) for i in range(frames)]), audio, 24)
+    return str(path)
+
+
+def test_continue_an_existing_video(tmp_path):
+    project = engine.create_project(tmp_path / "p", torch_settings(tmp_path), [Segment("b", 2), Segment("c", 1)],
+                                    start_video=start_video(tmp_path))
+    events = run(project)
+    assert events[-1].kind == "done", events[-1].text
+    assert [e.text for e in events if e.kind == "preview"] == ["Segment 1 of 2 done.", "Segment 2 of 2 done."]
+    # The clip, then the new frames, numbered on without a gap, with the tone running through the seam.
+    assert_seamless(events[-1].path, 60 + 48 + 24)
+    # The model's VAE color shift is cancelled at the seam and after it.
+    frames = media.read_frames(events[-1].path, W, H)
+    drift = frames[-1][H // 4, W - 1].astype(int) - frames[0][H // 4, W - 1].astype(int)
+    assert np.abs(drift).max() <= 3, drift
+
+
+def test_continue_with_a_short_first_segment(tmp_path):
+    # 1 s adds 24 frames: the first decoded piece is just the re-decoded second, the seam spans two pieces.
+    project = engine.create_project(tmp_path / "p", torch_settings(tmp_path), [Segment("b", 1)],
+                                    start_video=start_video(tmp_path, frames=25))
+    events = run(project)
+    assert events[-1].kind == "done", events[-1].text
+    assert_seamless(events[-1].path, 25 + 24)
+
+
+def test_job_for_a_continued_video(tmp_path):
+    project = engine.create_project(
+        tmp_path / "p", torch_settings(tmp_path, anchor_strength=0.6), [Segment("b", 2), Segment("c", 4)],
+        reference_image=reference(tmp_path), start_video=start_video(tmp_path))
+    job = TorchRunner(project, FAKE).job()
+    # The first chunk is the clip's last second plus segment 1's new frames.
+    assert (job["first_frames"], job["new_frames"]) == (25 + 48, [96])
+    # The clip starts the shot, so the photo only re-anchors the end of each segment.
+    assert [(i["frame"], i["strength"]) for i in job["images"]] == [(72, 0.6), (168, 0.6)]
+    assert Path(job["start_tail"]).name == "start_tail.mp4" and job["start_tail_audio"] is True
+    assert media.probe(job["start_tail"]).frames == 25 and media.probe(job["start_tail"]).has_audio
+    assert media.probe(project.path("chunks", "start_head.mp4")).frames == 35
+    assert (job["seam_frames"], job["color_lock"]) == (8, True)
+
+    silent = engine.create_project(tmp_path / "q", torch_settings(tmp_path), [Segment("b", 2)],
+                                   start_video=start_video(tmp_path, sound=False))
+    assert TorchRunner(silent, FAKE).job()["start_tail_audio"] is False  # the prompt makes the sound
+    plain = engine.create_project(tmp_path / "r", torch_settings(tmp_path), [Segment("a", 2)])
+    assert TorchRunner(plain, FAKE).job()["start_tail"] is None

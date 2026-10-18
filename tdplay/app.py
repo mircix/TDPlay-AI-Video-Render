@@ -501,7 +501,7 @@ def build() -> gr.Blocks:
                     with gr.Column(scale=5):
                         image = gr.Image(label="Character / first frame (optional)", type="filepath",
                                          sources=["upload", "clipboard"], height=240)
-                        with gr.Accordion("…or continue a video you already have", open=False, visible=ON_MAC):
+                        with gr.Accordion("…or continue a video you already have", open=False):
                             start_video = gr.Video(label="Start video (any size; it is cropped to the shot size)",
                                                    sources=["upload"], height=200)
                         gr.Markdown(TIPS)

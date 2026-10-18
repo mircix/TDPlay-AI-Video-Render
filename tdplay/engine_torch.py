@@ -7,6 +7,11 @@ shares stopping, upscaling and error handling with the Mac runner (:class:`tdpla
 
 Resume starts the shot again from the beginning: the carry between segments lives inside the
 model run, so there is nothing on disk to continue from.
+
+A shot can also continue the user's own video. Its last second (picture and sound) is pinned at
+the start of the first chunk, exactly like the carry between later chunks, and the model's
+re-decode of that second is blended back into the original; the rest of the video comes first,
+as it is.
 """
 
 from __future__ import annotations
@@ -18,8 +23,11 @@ import shlex
 import sys
 from pathlib import Path
 
+import numpy as np
+
 from tdplay import media
 from tdplay.engine import (
+    CARRY_FRAMES,
     DISTILLED_STEPS,
     Event,
     Runner,
@@ -31,6 +39,8 @@ from tdplay.ltx_torch import segment_ends
 
 _SEGMENT = re.compile(r"SEGMENT (\d+)/(\d+)")
 _FRAMES = re.compile(r"FRAMES (\d+)/(\d+)")
+#: Peak level under which a start video counts as silent: the model then makes the sound from the prompt.
+SILENCE = 1e-3
 
 
 def default_torch_command() -> list[str]:
@@ -53,23 +63,56 @@ class TorchRunner(Runner):
 
     def job(self) -> dict:
         p, s = self.project, self.project.settings
-        first = first_segment_frames(p.segments[0].seconds, s.fps)
-        new = [8 * extend_latent_frames(seg.seconds, s.fps) for seg in p.segments[1:]]
+        new = [8 * extend_latent_frames(seg.seconds, s.fps) for seg in p.segments]
+        if p.start_video:  # the first chunk starts with the video's last second, which it continues
+            first = CARRY_FRAMES + new[0]
+        else:
+            first = first_segment_frames(p.segments[0].seconds, s.fps)
+        new = new[1:]
+        ends = segment_ends(first, new)
         images = []
         if p.reference_image:
-            images.append({"path": str(p.path(p.reference_image)), "frame": 0, "strength": 1.0})
-            if s.anchor_strength > 0:  # re-anchor the photo on the last frame of every later segment
-                images += [{"path": str(p.path(p.reference_image)), "frame": end - 1, "strength": s.anchor_strength}
-                           for end in segment_ends(first, new)[1:]]
+            photo = str(p.path(p.reference_image))
+            if not p.start_video:  # the photo starts the shot
+                images.append({"path": photo, "frame": 0, "strength": 1.0})
+            if s.anchor_strength > 0:  # and re-anchors the last frame of every segment it didn't start
+                images += [{"path": photo, "frame": end - 1, "strength": s.anchor_strength}
+                           for end in (ends if p.start_video else ends[1:])]
+        tail = self._start_files()[1] if p.start_video else None
         return {
             "chunks_dir": str(p.path("chunks")),
             "fps": s.fps, "width": s.width, "height": s.height, "seed": p.seeds[0],
             "prompts": [seg.prompt.strip() for seg in p.segments],
             "first_frames": first, "new_frames": new, "images": images,
+            "start_tail": str(tail) if tail else None,
+            "start_tail_audio": bool(tail and np.abs(media.read_audio(tail)).max(initial=0.0) > SILENCE),
+            "seam_frames": s.seam_frames, "color_lock": s.color_lock,
             "checkpoint": find_checkpoint(s.model_dir) if s.model_dir else "",
             "gemma_root": s.gemma_dir, "upsampler": s.upsampler, "offload": s.offload,
             "gpu_memory": s.gpu_memory,
         }
+
+    def _start_files(self) -> tuple[Path | None, Path]:
+        """Split the start video into what the shot keeps as it is, and the last second the model continues.
+
+        Returns the head (``chunks/start_head.mp4`` + ``.wav``; ``None`` if the video is just that second)
+        and the tail (``start_tail.mp4``, with its sound), which is the model's input.
+        """
+        p, s = self.project, self.project.settings
+        head, tail = p.path("chunks", "start_head.mp4"), p.path("start_tail.mp4")
+        if not tail.exists():
+            frames = media.read_frames(p.path(p.start_video), s.width, s.height)
+            audio = media.fit_audio(media.read_audio(p.path(p.start_video)),
+                                    media.samples_for_frames(len(frames), s.fps))
+            keep = len(frames) - CARRY_FRAMES
+            split = media.samples_for_frames(keep, s.fps)
+            if keep > 0:
+                media.write_video(head, frames[:keep], s.fps)
+                media.write_wav(head.with_suffix(".wav"), audio[:split])
+            tmp = tail.with_suffix(".tmp.mp4")
+            media.write_video(tmp, frames[keep:], s.fps, crf=media.TAIL_CRF, audio=audio[split:])
+            tmp.replace(tail)
+        return (head if head.exists() else None), tail
 
     def _stopped_text(self) -> str:
         return "Stopped. Resume renders the shot again from the start (finished segments can't be kept yet on Windows)."
@@ -79,6 +122,9 @@ class TorchRunner(Runner):
 
     def _assemble_pieces(self, out: Path) -> Path:
         videos = self._pieces()
+        head = self._start_files()[0] if self.project.start_video else None
+        if head:  # the shot continues the start video, which comes first
+            videos = [head, *videos]
         media.assemble(videos, [v.with_suffix(".wav") for v in videos], out)
         return out
 

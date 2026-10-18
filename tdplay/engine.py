@@ -59,6 +59,57 @@ def extend_latent_frames(seconds: int, fps: int = FPS) -> int:
     return max(1, round(seconds * fps / 8))
 
 
+# -- seams: joining a model output to the frames it continued from ------------------------------------------
+
+
+def color_lock_luts(original: np.ndarray, redecoded: np.ndarray) -> list[np.ndarray]:
+    """Per-channel lookup tables that cancel the color bias of a VAE round trip.
+
+    ``original`` and ``redecoded`` show the same frames, so the gap between their means is the bias.
+    """
+    delta = original.reshape(-1, 3).mean(axis=0) - redecoded.reshape(-1, 3).mean(axis=0)
+    delta = np.clip(delta, -MAX_COLOR_SHIFT, MAX_COLOR_SHIFT)
+    return [np.clip(np.round(np.arange(256) + d), 0, 255).astype(np.uint8) for d in delta]
+
+
+def apply_luts(frames: np.ndarray, luts: list[np.ndarray]) -> None:
+    """Apply :func:`color_lock_luts` to ``frames`` in place."""
+    for frame in frames:
+        for c in range(3):
+            frame[..., c] = luts[c][frame[..., c]]
+
+
+def splice(carry: tuple[np.ndarray, np.ndarray], out: np.ndarray, out_audio: np.ndarray, *, fps: int,
+           seam_frames: int, luts: list[np.ndarray] | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Splice a model output onto the carry tail it continued from.
+
+    The output starts with the model's own re-decode of the carried frames; the new frames follow
+    it. The carry's last ``seam_frames`` frames are cross-faded into that re-decode, and its audio is
+    cross-faded into the re-decoded audio, so the cut is invisible and silent. ``luts`` (from
+    :func:`color_lock_luts`) are applied to the output from the cross-fade on.
+    """
+    carry_frames, carry_audio = carry[0].copy(), carry[1].copy()
+    t = len(carry_frames)
+    k = min(seam_frames, t)
+    if luts is not None:
+        apply_luts(out[t - k:], luts)
+    for j in range(k):
+        a = (j + 1) / (k + 1)
+        idx = t - k + j
+        mixed = (1 - a) * carry_frames[idx].astype(np.float32) + a * out[idx].astype(np.float32)
+        carry_frames[idx] = np.clip(np.round(mixed), 0, 255).astype(np.uint8)
+
+    new_frames = out[t:]
+    cut = media.samples_for_frames(t, fps)
+    new_audio = media.fit_audio(out_audio[cut:], media.samples_for_frames(len(new_frames), fps))
+    xf = min(int(SEAM_AUDIO_SECONDS * media.SAMPLE_RATE), cut, len(carry_audio), len(out_audio))
+    if xf > 0 and len(out_audio) >= cut:
+        ramp = np.linspace(0.0, 1.0, xf, dtype=np.float32)[:, None]
+        carry_audio[-xf:] = carry_audio[-xf:] * (1 - ramp) + out_audio[cut - xf:cut] * ramp
+
+    return np.concatenate([carry_frames, new_frames]), np.concatenate([carry_audio, new_audio])
+
+
 @dataclass
 class Segment:
     prompt: str
@@ -197,8 +248,6 @@ def create_project(
         raise ValueError("The first segment must be at least 2 s (the next one continues its last second).")
     if settings.width % 64 or settings.height % 64:
         raise ValueError("Width and height must be multiples of 64.")
-    if start_video and settings.backend == "torch":
-        raise ValueError("Continuing an existing video isn't available in the Windows version yet.")
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     title = segments[0].prompt.strip().split("\n")[0][:80]
@@ -535,45 +584,14 @@ class Runner:
         return frames, audio
 
     def _join(self, carry: tuple[np.ndarray, np.ndarray], raw: Path) -> tuple[np.ndarray, np.ndarray]:
-        """Splice an extend output onto the carry tail it continued from.
-
-        The output starts with the model's own re-decode of the 25 carried frames; the new frames
-        follow it. The carry's last ``seam_frames`` frames are cross-faded into that re-decode, and
-        its audio is cross-faded into the re-decoded audio, so the cut is invisible and silent.
-        """
+        """Splice an extend output onto the carry tail it continued from (see :func:`splice`)."""
         s = self.project.settings
-        carry_frames, carry_audio = carry[0].copy(), carry[1].copy()
-        t = len(carry_frames)
+        t = len(carry[0])
         out = media.read_frames(raw, s.width, s.height)
-        out_audio = media.read_audio(raw)
         if len(out) <= t:
             raise _SegmentFailed(f"The model returned {len(out)} frames, expected more than {t}.")
-
-        if s.color_lock:
-            # Both means describe the same frames: the gap is the VAE round trip's color bias.
-            delta = carry_frames.reshape(-1, 3).mean(axis=0) - out[:t].reshape(-1, 3).mean(axis=0)
-            delta = np.clip(delta, -MAX_COLOR_SHIFT, MAX_COLOR_SHIFT)
-            luts = [np.clip(np.round(np.arange(256) + d), 0, 255).astype(np.uint8) for d in delta]
-            for frame in out[t - min(s.seam_frames, t):]:
-                for c in range(3):
-                    frame[..., c] = luts[c][frame[..., c]]
-
-        k = min(s.seam_frames, t)
-        for j in range(k):
-            a = (j + 1) / (k + 1)
-            idx = t - k + j
-            mixed = (1 - a) * carry_frames[idx].astype(np.float32) + a * out[idx].astype(np.float32)
-            carry_frames[idx] = np.clip(np.round(mixed), 0, 255).astype(np.uint8)
-
-        new_frames = out[t:]
-        cut = self._samples(t)
-        new_audio = media.fit_audio(out_audio[cut:], self._samples(len(new_frames)))
-        xf = min(int(SEAM_AUDIO_SECONDS * media.SAMPLE_RATE), cut, len(carry_audio), len(out_audio))
-        if xf > 0 and len(out_audio) >= cut:
-            ramp = np.linspace(0.0, 1.0, xf, dtype=np.float32)[:, None]
-            carry_audio[-xf:] = carry_audio[-xf:] * (1 - ramp) + out_audio[cut - xf:cut] * ramp
-
-        return np.concatenate([carry_frames, new_frames]), np.concatenate([carry_audio, new_audio])
+        luts = color_lock_luts(carry[0], out[:t]) if s.color_lock else None
+        return splice(carry, out, media.read_audio(raw), fps=s.fps, seam_frames=s.seam_frames, luts=luts)
 
     def _commit(self, frames: np.ndarray, audio: np.ndarray, *, finished_segment: bool = True) -> tuple:
         """Write everything but the last 25 frames as a chunk, keep those as the new carry, save state.
