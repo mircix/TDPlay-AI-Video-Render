@@ -125,6 +125,8 @@ def main() -> None:
     args = parser.parse_args()
 
     print("[Loading text encoder (Gemma)] ...", file=sys.stderr, flush=True)
+    print(f"MIOpen settings: {os.environ.get('MIOPEN_LOG_LEVEL')} {os.environ.get('MIOPEN_FIND_MODE')}",
+          file=sys.stderr, flush=True)
     print(f"prompt: {args.prompt}", file=sys.stderr, flush=True)
     fail = os.environ.get("FAKE_LTX_FAIL_ON")
     if fail and fail in args.output:

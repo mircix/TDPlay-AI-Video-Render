@@ -77,6 +77,7 @@ def test_three_segments_make_one_seamless_shot(tmp_path):
     assert saved.status == "complete" and saved.done == 3
     log = (project.dir / "log.txt").read_text()
     assert "--image" in log and "last 0.70" in log
+    assert "MIOpen settings: 3 FAST" in log  # AMD's convolution library: quiet, no exhaustive tuning
 
 
 def test_folders_with_spaces_and_apostrophes(tmp_path):

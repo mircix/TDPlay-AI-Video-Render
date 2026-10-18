@@ -17,6 +17,7 @@ the decoded pieces as ``chunks/piece_NNN.mp4`` + ``.wav`` into the project folde
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
@@ -206,17 +207,29 @@ def stream_without_scale_keys() -> None:
 # LTX-2 streams the transformer's 48 blocks through 2 GPU slots, evicting the oldest. Every denoising step
 # runs the blocks in order, so with Low-RAM mode each step reads the whole transformer from disk again while
 # most of the GPU's memory sits unused. These patches keep as many blocks as fit on the GPU for a whole pass
-# and stream only the rest. The pass's working memory (activations) must still fit: before a pass kind has
-# run, a cautious reserve is left free; after it has run, its measured peak (per latent token) is used.
+# and stream only the rest. The pass's working memory (activations) must still fit: a reserve is left free
+# for it, at least MIN_RESERVE_GB and more if a pass of that kind measurably needed more.
+#
+# The model never gets the whole card, though. The display runs on it too, and when a card's memory runs out
+# Windows doesn't fail the allocation: it moves memory to system RAM, which slows everything to a crawl and
+# can make the display driver hang (black screens, a restart). So the model is held to GPU_MEMORY_SHARE of
+# the card (PyTorch enforces it); a pass that runs out of memory within that is run again with more room.
 
-#: GPU memory kept free for a pass's working memory before that kind of pass has been measured.
-FIRST_RESERVE_GB = {"draft": 6.0, "refine": 10.0}
+#: Share of the graphics card's memory the model may use; the rest is left to Windows and other apps.
+GPU_MEMORY_SHARE = 0.8
+#: GPU memory kept free for a pass's working memory, at least (the first segment's passes ran fine with it).
+MIN_RESERVE_GB = {"draft": 6.0, "refine": 10.0}
+#: More working memory a pass gets each time it ran out, and how often it is tried again.
+OOM_STEP_GB = 4.0
+OOM_RETRIES = 3
 #: Blocks that keep streaming through the GPU besides the resident ones (LTX-2's own default).
 STREAMING_SLOTS = 2
 
 _pass: ContextVar[tuple[str, int]] = ContextVar("tdplay_gpu_pass", default=("refine", 0))
 #: Peak working memory per latent token, measured per pass kind ("draft": half resolution, "refine": full).
 _working_bytes_per_token: dict[str, float] = {}
+#: Extra working memory per pass kind, after a pass of that kind ran out of memory.
+_extra_reserve: dict[str, int] = {}
 
 
 class GpuPass:
@@ -226,11 +239,24 @@ class GpuPass:
         self._stage, self._kind = stage, kind
 
     def __call__(self, *args, **kwargs):
+        import torch
+
         video = kwargs["modalities"].video
         tokens = video.latent.numel() // video.latent.shape[1] if video is not None else 0
         token = _pass.set((self._kind, tokens))
         try:
-            return self._stage(*args, **kwargs)
+            for attempt in range(OOM_RETRIES + 1):
+                try:
+                    return self._stage(*args, **kwargs)
+                except torch.OutOfMemoryError:
+                    if attempt == OOM_RETRIES:
+                        raise
+                # Out of the except block, so the failed attempt's tensors are unreachable and can be freed.
+                _extra_reserve[self._kind] = _extra_reserve.get(self._kind, 0) + int(OOM_STEP_GB * 2**30)
+                print(f"GPU: out of memory in the {self._kind} pass; trying it again with fewer blocks on the card",
+                      flush=True)
+                gc.collect()
+                torch.cuda.empty_cache()
         finally:
             _pass.reset(token)
 
@@ -242,10 +268,32 @@ def gpu_reserve(kind: str, tokens: int) -> int:
     """Bytes of GPU memory to keep free for a pass's working memory."""
     if os.environ.get("TDPLAY_GPU_RESERVE_GB"):
         return int(float(os.environ["TDPLAY_GPU_RESERVE_GB"]) * 2**30)
+    reserve = MIN_RESERVE_GB[kind] * 2**30
     per_token = _working_bytes_per_token.get(kind)
-    if per_token and tokens:
-        return int(per_token * tokens * 1.25) + 2**30  # measured, plus a quarter and 1 GB for the allocator
-    return int(FIRST_RESERVE_GB[kind] * 2**30)
+    if per_token and tokens:  # measured, plus a quarter and 1 GB for the allocator
+        reserve = max(reserve, per_token * tokens * 1.25 + 2**30)
+    return int(reserve) + _extra_reserve.get(kind, 0)
+
+
+def limit_gpu_memory() -> None:
+    """Hold the model to its share of the graphics card (``TDPLAY_GPU_MEMORY_SHARE`` overrides it)."""
+    import torch
+
+    if torch.cuda.is_available():
+        share = float(os.environ.get("TDPLAY_GPU_MEMORY_SHARE") or GPU_MEMORY_SHARE)
+        torch.cuda.set_per_process_memory_fraction(min(max(share, 0.1), 1.0))
+
+
+def gpu_budget(device) -> int:
+    """Bytes this process can still put on the GPU: what is free on the card, within its share of it."""
+    import torch
+
+    torch.cuda.empty_cache()  # what earlier passes left in PyTorch's cache goes back to the card first
+    free, total = torch.cuda.mem_get_info(device)
+    total = min(total, torch.cuda.get_device_properties(device).total_memory)
+    allocated = torch.cuda.memory_allocated(device)
+    within_share = int(torch.cuda.get_per_process_memory_fraction(device) * total) - allocated
+    return max(0, min(free + torch.cuda.memory_reserved(device) - allocated, within_share))
 
 
 def resident_block_count(available: int, slot_nbytes: int, blocks: int, reserve: int) -> int:
@@ -329,9 +377,8 @@ def keep_blocks_on_gpu() -> None:
             if torch.device(pool_device).type != "cuda":
                 return buffer_pool(slot_nbytes, capacity, pool_device, **pool_kwargs)
             try:
-                free, _total = torch.cuda.mem_get_info(pool_device)
-                available = free + torch.cuda.memory_reserved(pool_device) - torch.cuda.memory_allocated(pool_device)
-            except RuntimeError:  # the driver can't say: stream everything, as LTX-2 does
+                available = gpu_budget(pool_device)
+            except (RuntimeError, AttributeError):  # the driver can't say: stream everything, as LTX-2 does
                 available = 0
             resident = resident_block_count(available, slot_nbytes, plan["blocks"], gpu_reserve(kind, tokens))
             while True:  # if the GPU can't give one buffer that large after all, keep fewer blocks
@@ -366,6 +413,7 @@ def keep_blocks_on_gpu() -> None:
                 working = max(0, torch.cuda.max_memory_allocated(device) - weights)
                 _working_bytes_per_token[kind] = max(working / tokens, _working_bytes_per_token.get(kind, 0.0))
             teardown()
+            torch.cuda.empty_cache()  # give the blocks' memory back to the card between passes
 
         wrapper.teardown = teardown_and_measure
         return wrapper
@@ -384,6 +432,7 @@ def render(job: dict) -> None:
 
     read_weights_without_mapping()
     stream_without_scale_keys()
+    limit_gpu_memory()
     keep_blocks_on_gpu()
     out_dir = Path(job["chunks_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)

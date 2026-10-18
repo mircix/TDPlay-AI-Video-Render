@@ -468,6 +468,10 @@ class Runner:
                    # UTF-8 for the helper's output and files, not Windows' legacy code page: progress bars and
                    # prompts aren't in it.
                    PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        # AMD's MIOpen (convolutions on Radeon cards): only errors in the log, not its harmless workspace
+        # warnings, and no benchmarking of every convolution method the first time a size comes up, which
+        # takes long and was running when a PC's display driver crashed. Settings already in the environment win.
+        env = {"MIOPEN_LOG_LEVEL": "3", "MIOPEN_FIND_MODE": "FAST", **env}
         with self.project.path("log.txt").open("a", encoding="utf-8", errors="replace") as log:
             log.write(f"\n$ {shlex.join(cmd)}\n")
             self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,

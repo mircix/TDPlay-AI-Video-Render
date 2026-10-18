@@ -167,8 +167,10 @@ The app picks these for you: **LTX-2.3 distilled, 8-bit** (official Lightricks w
 text encoder), **576p**, segments **up to 5 s**. With less than 48 GB of RAM, *Low-RAM mode* is on: the model's
 weights stream from the SSD instead of being held in memory, which is what makes 32 GB of RAM work. As much of the model
 as fits stays on the graphics card for the whole render, and only the rest streams from the SSD: the log says
-how much ("GPU: keeping 30 of 48 transformer blocks on the card"). The more of it stays on the card, the faster. 704p
-(1280×704) is worth trying on a 24 GB card.
+how much ("GPU: keeping 26 of 48 transformer blocks on the card"). The more of it stays on the card, the faster. The
+model never takes more than 80 % of the card's memory: Windows, the display and your other apps need the rest, and
+when a card runs out, Windows makes everything crawl and the display driver can crash. 704p (1280×704) is worth
+trying on a 24 GB card.
 
 ### How the Windows version differs
 
