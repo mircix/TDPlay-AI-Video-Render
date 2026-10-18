@@ -90,6 +90,26 @@ the scene. Write each one's name and outfit under their photo: building the scen
 A pasted-in person can still look pasted in. On Windows, building a scene also sets **First frame strength**
 (Settings) to 0.85, so the model repaints the first frame a little and blends the light; 1 keeps it exactly as built.
 
+### Your characters, and making their pictures
+
+The **Characters** tab keeps the people in your shots: a name, a photo, and their clothes and hair. **Start a shot
+with them** puts their photo in as the first frame; **Add them to the scene** puts them into the scene builder. Either
+way their clothes and hair go into **Characters**, so the model is reminded in every segment.
+
+No photo of them? **Make a picture of a character** draws one, on your computer, with FLUX.2 [klein] 4B (Black Forest
+Labs; downloaded once, about 16 GB):
+
+* **Describe them** and press **Make 4 pictures**. *Full body* with a *plain studio background* is the best start
+  for the scene builder; pick *16:9* or *9:16* for a picture that opens a shot.
+* **…or change the clothes in the photo above**: write the new clothes and press **Change the outfit**. The person,
+  pose and background stay; only the clothes change.
+
+Click the picture you like: it becomes the character's photo. **Save** keeps it (for a character you're editing,
+it replaces their photo); **Save as a new character** keeps the old one too, e.g. *Mia* and *Mia (summer)*. Each
+press makes four pictures, one at a time; the first press after starting the app takes longer while the model loads.
+Pictures and video renders take turns on the graphics card: while a video is being made, wait for it to finish. Use
+it only for photos of yourself or of people who agreed.
+
 ### Add-ons (LoRAs), Windows
 
 LoRAs are add-ons that change how the model renders a whole shot. **Add-ons (LoRAs)** on the Create tab takes up
@@ -223,6 +243,8 @@ go back to Balanced if the screen flickers or goes black. 704p (1280×704) is wo
   segment, the same way each segment carries into the next, and blends the model's version of that second back into
   your original frames. Your clip comes first in the result, unchanged.
 * **1080p / 4K upscaling** works the same way, with Real-ESRGAN on the GPU through PyTorch.
+* **Only on Windows**: add-ons (LoRAs) and the *Graphics card memory* setting. Everything else (characters and their
+  pictures, the scene builder, continuing a video, the projects folder) is on both.
 * **Speed is not measured yet.** Your first run is the benchmark; the log shows every step.
 
 ### Troubleshooting on Windows
@@ -326,6 +348,9 @@ H3 is a larger cloud model. Expect LTX-2 on a laptop to be good but not identica
   **[spandrel](https://github.com/chaiNNer-org/spandrel)** (MIT) for Real-ESRGAN there.
 * **[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)** (BSD-3-Clause) by Xintao Wang et al. for upscaling,
   using the MLX conversions `mlx-community/Real-ESRGAN-general-x4v3` and `mlx-community/Real-ESRGAN-x4plus`.
+* **[FLUX.2 [klein] 4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)** (Apache-2.0) by Black Forest Labs
+  makes the character pictures, through **[diffusers](https://github.com/huggingface/diffusers)** (Apache-2.0) on
+  Windows and **[mflux](https://github.com/filipstrand/mflux)** (MIT) on a Mac.
 * **[Gradio](https://gradio.app)** (Apache-2.0) for the interface, **[pywebview](https://pywebview.flowrl.com)**
   (BSD-3-Clause) for the app window, **[ffmpeg](https://ffmpeg.org)** for video.
 * "RunningHub", "MiniMax" and "H3" are named only to describe the workflow TDPlay AI Video Render recreates. This project is not

@@ -5,5 +5,7 @@ numpy
 pillow
 # the scene builder's cut-out model (ISNet) runs on ONNX Runtime
 onnxruntime==1.30.0
+# the character creator's picture model (FLUX.2 [klein]) on MLX
+mflux==0.21.0; sys_platform == "darwin"
 # the app's own window on macOS (WebKit)
 pywebview==6.2.1; sys_platform == "darwin"

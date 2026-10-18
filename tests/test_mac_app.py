@@ -252,3 +252,67 @@ def test_a_render_checks_its_loras_first(tmp_path, monkeypatch):
     missing = generate(str(tmp_path / "gone.safetensors"), "", "", "", 1.0, 1.0, 1.0, 1.0)
     assert "there any more" in missing[-1][0] and len(created) == 2
     assert loras.MAX_LORAS == 4
+
+
+def test_character_creator_in_the_window(tmp_path, monkeypatch):
+    import shlex
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    from tdplay import app, characters, creator, models
+
+    monkeypatch.setattr(models, "HOME", tmp_path / "home")
+    monkeypatch.setattr(models, "MODELS_DIR", tmp_path / "home" / "models")
+    monkeypatch.setenv("TDPLAY_CREATOR_CMD", shlex.join([sys.executable, str(ROOT / "tests" / "fake_creator.py")]))
+    monkeypatch.setattr(app, "active_job", lambda: None)
+    assert "Download the picture model" in list(app.make_from_description("a woman", True, "1:1 square"))[-1][-1]
+    assert "FLUX.2 [klein] 4B" in app.models_table() and "not downloaded" in app.models_table()
+
+    # The download fetches only the diffusers layout, which mflux reads too.
+    def download(repo, patterns):
+        assert repo == creator.REPO and "transformer/*" in patterns and "*.safetensors" not in patterns
+        yield models.DownloadProgress(repo, 8_000_000_000, 16_000_000_000)
+        monkeypatch.setattr(creator, "ready", lambda: True)
+        yield models.DownloadProgress(repo, 16_000_000_000, 16_000_000_000, finished=True)
+
+    monkeypatch.setattr(models, "download", download)
+    monkeypatch.setattr(app.shutil, "disk_usage", lambda path: SimpleNamespace(free=18e9))
+    assert "Not enough free disk space" in list(app.download_creator())[-1][0]
+    monkeypatch.setattr(app.shutil, "disk_usage", lambda path: SimpleNamespace(free=500e9))
+    note, row = list(app.download_creator())[-1]
+    assert note == "The picture model is ready." and row["visible"] is False and not app._state.get("downloading")
+
+    # Four pictures from a description, shown as they are made; a click makes one the character's photo.
+    steps = list(app.make_from_description("a woman with long black hair", True, "Full body (2:3)"))
+    gallery, pictures, wanted, note = steps[-1]
+    assert len(pictures) == creator.COUNT and gallery == pictures and "Click the picture you like" in note
+    assert [len(s[1]) for s in steps if isinstance(s[1], list)][:2] == [1, 2]  # one at a time
+    with Image.open(pictures[0]) as picture:
+        assert picture.size == creator.SHAPES["Full body (2:3)"]
+    photo, notes, note = app.use_picture(SimpleNamespace(index=2), pictures, wanted, "")
+    assert photo == pictures[2] and notes == "a woman with long black hair" and "Press **Save**" in note
+    assert app.use_picture(SimpleNamespace(index=1), pictures, wanted, "red coat")[1] == app.gr.skip()
+    _, photo_out, folder, note = app.save_character("Mia", photo, "black lace slip dress", None)
+    assert "Saved **Mia**" in note and characters.load(folder).notes == "black lace slip dress"
+
+    # The same person in other clothes, saved as a second character.
+    steps = list(app.change_outfit(photo_out, "a red summer dress"))
+    _, outfits, wanted, note = steps[-1]
+    assert len(outfits) == creator.COUNT and wanted == {"mode": "outfit", "text": "a red summer dress"}
+    photo, notes, note = app.use_picture(SimpleNamespace(index=0), outfits, wanted, "black lace slip dress")
+    assert notes == app.gr.skip() and "Update **Clothes, hair, look**" in note
+    app.save_new_character("Mia (summer)", photo, "a red summer dress")
+    assert [c.name for c in characters.everyone()] == ["Mia", "Mia (summer)"]
+    with Image.open(characters.everyone()[0].photo) as before:
+        assert before.size == creator.SHAPES["Full body (2:3)"]  # the first Mia keeps her photo
+
+    # Problems are said, not raised; and pictures and renders take turns on the graphics card.
+    assert "Add a photo first" in list(app.change_outfit(None, "a dress"))[-1][-1]
+    assert "Describe the character first" in list(app.make_from_description(" ", True, "1:1 square"))[-1][-1]
+    monkeypatch.setattr(app, "active_job", lambda: "/projects/shot")
+    assert "Wait until the video" in list(app.make_from_description("a man", True, "1:1 square"))[-1][-1]
+    monkeypatch.setattr(app, "active_job", lambda: None)
+    monkeypatch.setattr(creator, "running", lambda: True)
+    assert "Character pictures are being made" in next(app._start(None, ["render"]))[0]
+    assert app.stop_pictures() == "Nothing is being made."

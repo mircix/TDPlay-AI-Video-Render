@@ -16,6 +16,8 @@ huggingface_hub
 numpy
 pillow
 pywebview==6.2.1
+# the character creator's picture model (FLUX.2 [klein])
+diffusers==0.40.0
 # the scene builder's cut-out model (ISNet) runs on ONNX Runtime
 onnxruntime==1.30.0
 spandrel

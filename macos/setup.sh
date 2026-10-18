@@ -92,7 +92,7 @@ if [[ ! -d "${LTX_DIR}/packages" ]]; then
 fi
 
 # --- Python and the packages --------------------------------------------------------------------
-step "Setting up Python ${PY_VERSION} and the app's packages (about 1 GB the first time)"
+step "Setting up Python ${PY_VERSION} and the app's packages (about 1.5 GB the first time)"
 export UV_PYTHON_INSTALL_DIR="${RUNTIME}/python"
 "${UV}" venv --quiet --allow-existing --managed-python --python "${PY_VERSION}" "${RUNTIME}/venv"
 PY="${RUNTIME}/venv/bin/python"

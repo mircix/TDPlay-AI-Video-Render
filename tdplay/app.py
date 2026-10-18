@@ -6,6 +6,7 @@ Start it with ``./start.command`` (or ``python -m tdplay``); it opens in your br
 from __future__ import annotations
 
 import html
+import itertools
 import json
 import os
 import platform
@@ -19,7 +20,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from tdplay import __version__, characters, engine, loras, models, scene, worker
+from tdplay import __version__, characters, creator, engine, loras, models, scene, worker
 
 MAX_SEGMENTS = 20
 PROJECTS_DIR = models.HOME / "projects"
@@ -64,7 +65,13 @@ CHARACTERS_HELP = """
 Save the people in your shots once: a name, a photo (full-body works best) and their clothes and hair. Then
 **Start a shot with them** (their photo becomes the first frame) or **Add them to the scene** (the scene builder,
 for several people in one place). Their clothes and hair go into the Characters box, which reminds the model in
-every segment what they wear.
+every segment what they wear. No photo? Make one below.
+"""
+
+CREATOR_HELP = """
+**Describe someone** and get four pictures to choose from, or **change the clothes** in the photo above and keep
+the person. Click the picture you like: it becomes the character's photo. This uses FLUX.2 [klein] 4B (Black Forest
+Labs, Apache 2.0), on this computer like everything else. Change only photos of yourself, or of people who agreed.
 """
 
 RAM_GB = models.system_ram_gb()
@@ -215,6 +222,11 @@ def save_character(name, photo, notes, folder):
     return character_gallery(), str(person.photo), str(person.folder), f"Saved **{person.name}**."
 
 
+def save_new_character(name, photo, notes):
+    """Save the form as another character (the one being edited stays as it was)."""
+    return save_character(name, photo, notes, None)
+
+
 def delete_character(folder):
     if not folder:
         return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), "Click a character in the library first."
@@ -246,6 +258,102 @@ def add_character_to_scene(folder, *slots):
     pictures[free], notes[free] = str(person.photo), person.line
     return [*pictures, *notes, gr.Accordion(open=True), gr.Tabs(selected="create"),
             f"**{person.name}** is in the scene builder (Create tab), as character {free + 1}."]
+
+
+def creator_download_note() -> str:
+    if creator.ready():
+        return ""
+    return (f"The picture model isn't downloaded yet: press **Download the picture model** (about "
+            f"{creator.DOWNLOAD_GB} GB, once).")
+
+
+def download_creator():
+    """Download FLUX.2 [klein] 4B for the character creator."""
+    models.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(models.MODELS_DIR).free / 1e9
+    if not creator.ready() and free < creator.DOWNLOAD_GB + 5:
+        yield (f"⚠️ Not enough free disk space: the picture model needs about {creator.DOWNLOAD_GB} GB, "
+               f"{free:.0f} GB is free."), gr.skip()
+        return
+    _state["downloading"] = True
+    try:
+        started = time.time()
+        for progress in creator.download():
+            yield f"Downloading the picture model: {models.wait_message(progress, started)}", gr.skip()
+    except Exception as exc:  # network errors, disk full, ...
+        yield (f"⚠️ The download stopped ({type(exc).__name__}: {exc}). Press the button again: it continues where "
+               "it stopped."), gr.skip()
+        return
+    finally:
+        _state["downloading"] = False
+    yield "The picture model is ready.", gr.update(visible=False)
+
+
+def _make_pictures(request_for):
+    """Make pictures in their own process, showing each one as soon as it's done.
+
+    Yields ``(gallery, pictures, last_request, note)``; ``request_for()`` builds the request (or raises ValueError).
+    """
+    skip = (gr.skip(), gr.skip(), gr.skip())
+    if not creator.ready():
+        yield *skip, "⚠️ " + creator_download_note()
+        return
+    if active_job():
+        yield *skip, "⚠️ Wait until the video being made is finished: both need the graphics card's memory."
+        return
+    try:
+        request = request_for()
+    except (ValueError, OSError) as exc:
+        yield *skip, f"⚠️ {exc}"
+        return
+    with _lock:
+        if creator.running():
+            yield *skip, "⚠️ Already making pictures: wait for them, or press Stop."
+            return
+        events = creator.make(request)
+        first = next(events)  # the process has started: a render can't start now
+    made: list[str] = []
+    wanted = {"mode": request["mode"], "text": request["text"]}
+    try:
+        for event in itertools.chain([first], events):
+            kind = event["kind"]
+            if kind == "picture":
+                made.append(event["path"])
+                yield list(made), list(made), wanted, f"{len(made)} of {len(request['seeds'])} ready…"
+            elif kind == "status":
+                yield *skip, event["text"]
+            elif kind == "done":
+                yield list(made), list(made), wanted, "Click the picture you like: it becomes the character's photo."
+            elif kind == "stopped":
+                yield list(made), list(made), wanted, "Stopped."
+            else:
+                yield list(made), list(made), wanted, f"⚠️ {event.get('text', 'The pictures could not be made.')}"
+    finally:
+        events.close()
+
+
+def make_from_description(description, studio, shape):
+    yield from _make_pictures(lambda: {**creator.describe_job(description, studio, shape), "text": description})
+
+
+def change_outfit(photo, outfit):
+    yield from _make_pictures(lambda: {**creator.outfit_job(photo, outfit), "text": outfit})
+
+
+def stop_pictures() -> str:
+    return "Stopping…" if creator.stop() else "Nothing is being made."
+
+
+def use_picture(evt: gr.SelectData, pictures, wanted, notes):
+    """A made picture was clicked: it becomes the character's photo (and its description their notes, if empty)."""
+    if evt.index is None or not 0 <= int(evt.index) < len(pictures or []):
+        return gr.skip(), gr.skip(), ""
+    text = " ".join(str((wanted or {}).get("text", "")).split())
+    filled = not str(notes or "").strip() and text
+    note = "It's the character's photo now. Press **Save** (or **Save as a new character**) to keep it."
+    if not filled and (wanted or {}).get("mode") == "outfit":
+        note += " Update **Clothes, hair, look** to the new clothes too."
+    return pictures[int(evt.index)], text if filled else gr.skip(), note
 
 
 def spread_characters(*pictures):
@@ -451,6 +559,10 @@ def _start(project: engine.Project, job: list[str], resume_hint: bool = True):
         if busy:
             yield (status_html("Already working on another video — wait for it to finish or press Stop.",
                                tone="warn", detail=Path(busy).name), gr.skip(), gr.skip())
+            return
+        if creator.running():
+            yield (status_html("Character pictures are being made — wait for them (Characters tab): both need the "
+                               "graphics card's memory.", tone="warn"), gr.skip(), gr.skip())
             return
         if not ON_MAC:  # the card's memory setting applies to whatever runs next, a resumed render too
             project.settings.gpu_memory = gpu_memory_pref()
@@ -731,6 +843,8 @@ def models_table() -> str:
         ready = "✅ ready" if models.preset_ready(p) else "not downloaded"
         mark = f" ← recommended for this {COMPUTER}" if key == REC.preset else ""
         rows.append(f"| {p.label}{mark} | {_SIZES.get(key, '?')} | {ready} |")
+    ready = "✅ ready" if creator.ready() else "not downloaded (Characters tab)"
+    rows.append(f"| FLUX.2 [klein] 4B · character pictures (Apache 2.0) | ≈ {creator.DOWNLOAD_GB} GB | {ready} |")
     free = shutil.disk_usage(models.HOME if models.HOME.exists() else Path.home()).free / 1e9
     rows.append(f"\nFree disk space: **{free:.0f} GB** · models are stored in `{models.MODELS_DIR}`")
     return "\n".join(rows)
@@ -946,12 +1060,41 @@ def build() -> gr.Blocks:
                                                             "long black hair")
                         with gr.Row():
                             char_save_btn = gr.Button("Save", variant="primary")
+                            char_save_new_btn = gr.Button("Save as a new character")
+                        with gr.Row():
                             char_new_btn = gr.Button("New character")
                             char_delete_btn = gr.Button("Delete", variant="stop")
                         with gr.Row():
                             char_start_btn = gr.Button("Start a shot with them")
                             char_scene_btn = gr.Button("Add them to the scene")
                         char_note = gr.Markdown()
+                with gr.Accordion("Make a picture of a character", open=True):
+                    gr.Markdown(CREATOR_HELP)
+                    with gr.Row(visible=not creator.ready()) as creator_download_row:
+                        creator_download_btn = gr.Button(
+                            f"Download the picture model (about {creator.DOWNLOAD_GB} GB)", variant="primary")
+                    with gr.Row(equal_height=False):
+                        with gr.Column(scale=4):
+                            describe_box = gr.Textbox(
+                                label="Describe them", lines=3, max_lines=6,
+                                placeholder="a woman in her twenties with long black hair, black lace slip dress "
+                                            "with thin straps, silver choker")
+                            with gr.Row():
+                                shape_pick = gr.Dropdown(list(creator.SHAPES), value="Full body (2:3)", label="Shape",
+                                                         min_width=160)
+                                studio_box = gr.Checkbox(True, label="Plain studio background (best for the scene "
+                                                                     "builder)")
+                            describe_btn = gr.Button(f"Make {creator.COUNT} pictures", variant="primary")
+                            outfit_box = gr.Textbox(label="…or change the clothes in the photo above", lines=2,
+                                                    max_lines=4, placeholder="a red summer dress and white sneakers")
+                            outfit_btn = gr.Button(f"Change the outfit ({creator.COUNT} pictures)")
+                            creator_stop_btn = gr.Button("Stop", variant="stop", size="sm")
+                        with gr.Column(scale=5):
+                            made_gallery = gr.Gallery(label="Click the one you like", columns=2, rows=2, height=560,
+                                                      allow_preview=False, object_fit="contain")
+                            creator_note = gr.Markdown(creator_download_note())
+                    made_pictures = gr.State([])
+                    made_request = gr.State(None)
             with gr.Tab("Projects", id="projects") as projects_tab:
                 with gr.Row():
                     folder_box = gr.Textbox(str(projects_dir()), label="New projects are saved in", scale=5)
@@ -1071,6 +1214,21 @@ def build() -> gr.Blocks:
                             api_visibility="private", queue=False)
         char_save_btn.click(save_character, [char_name, char_photo, char_notes, char_folder],
                             [char_gallery, char_photo, char_folder, char_note], api_visibility="private")
+        char_save_new_btn.click(save_new_character, [char_name, char_photo, char_notes],
+                                [char_gallery, char_photo, char_folder, char_note], api_visibility="private")
+        creator_download_btn.click(download_creator, None, [creator_note, creator_download_row],
+                                   api_visibility="private", show_progress="hidden")
+        made = [made_gallery, made_pictures, made_request, creator_note]
+        # Their own queue, so making pictures doesn't wait for a render being followed, or the other way round.
+        pictures = dict(api_visibility="private", show_progress="hidden", concurrency_id="pictures")
+        describe_btn.click(make_from_description, [describe_box, studio_box, shape_pick], made, **pictures)
+        outfit_btn.click(change_outfit, [char_photo, outfit_box], made, **pictures)
+        creator_stop_btn.click(stop_pictures, None, creator_note, api_visibility="private", queue=False)
+        made_gallery.select(use_picture, [made_pictures, made_request, char_notes],
+                            [char_photo, char_notes, char_note], api_visibility="private", queue=False)
+        characters_tab.select(creator_download_note, None, creator_note, api_visibility="private", queue=False)
+        characters_tab.select(lambda: gr.update(visible=not creator.ready()), None, creator_download_row,
+                              api_visibility="private", queue=False)
         char_new_btn.click(lambda: ("", None, "", None, ""), None,
                            [char_name, char_photo, char_notes, char_folder, char_note], api_visibility="private",
                            queue=False)

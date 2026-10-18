@@ -6,6 +6,8 @@
 2. A two-segment shot renders as a background job through the installed code, with the stand-in
    model from this folder (no GPU or model weights needed), and comes out with every frame.
 3. The scene builder downloads its cut-out model, runs it on ONNX Runtime and builds a first frame.
+4. The character creator's picture library is installed (mflux on a Mac, diffusers elsewhere), and pictures
+   are made in their own process through the installed code (by a stand-in model: no weights needed).
 """
 
 from __future__ import annotations
@@ -88,6 +90,29 @@ def check_scene(home: Path) -> None:
     print("Scene builder OK.")
 
 
+def check_creator(home: Path) -> None:
+    from PIL import Image
+
+    from tdplay import creator
+
+    if sys.platform == "darwin":
+        from mflux.models.common.config import ModelConfig
+        from mflux.models.flux2.variants import Flux2Klein, Flux2KleinEdit  # noqa: F401
+
+        ModelConfig.flux2_klein_4b()
+    else:
+        from diffusers import Flux2KleinPipeline  # noqa: F401
+    os.environ["TDPLAY_CREATOR_CMD"] = shlex.join([sys.executable, str(TESTS / "fake_creator.py")])
+    request = creator.describe_job("a woman with long black hair", True, "Full body (2:3)", count=2)
+    events = list(creator.make(request))
+    assert events[-1]["kind"] == "done", events
+    pictures = [e["path"] for e in events if e["kind"] == "picture"]
+    assert len(pictures) == 2
+    with Image.open(pictures[0]) as picture:
+        assert picture.size == creator.SHAPES["Full body (2:3)"]
+    print("Character creator OK.")
+
+
 def main() -> None:
     app_root = Path(sys.argv[1]).resolve()
     sys.path.insert(0, str(app_root))  # the installed code, not this checkout's
@@ -106,6 +131,7 @@ def main() -> None:
     check_server(app_root, env)
     check_render(home)
     check_scene(home)
+    check_creator(home)
     print("Smoke test passed.")
 
 
