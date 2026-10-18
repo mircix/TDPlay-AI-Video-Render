@@ -1,4 +1,4 @@
-"""Upscaler tests: real Real-ESRGAN (MLX) on a tiny clip, parity with PyTorch, and the engine step."""
+"""Upscaler tests: real Real-ESRGAN (MLX on a Mac, PyTorch on Windows) on a tiny clip, parity, the engine step."""
 
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ FAKE_UPSCALE = [sys.executable, str(Path(__file__).parent / "fake_upscale.py")]
 @pytest.fixture(scope="module")
 def weights_home(tmp_path_factory):
     """Real-ESRGAN weights are downloaded once per test run (2.4 MB for the fast model)."""
-    pytest.importorskip("mlx.core")
     home = tmp_path_factory.mktemp("models")
     old = models.MODELS_DIR
     models.MODELS_DIR = home
@@ -55,8 +54,17 @@ def test_target_sizes():
     assert target_size("4k", 576, 576) == (2160, 2160)
 
 
-def test_real_upscale_of_a_tiny_clip(tmp_path, weights_home):
+def use_backend(backend: str, monkeypatch) -> None:
+    """Run the upscaler on ``backend`` ("mlx": the Mac one, "torch": the Windows one), if it is installed."""
+    pytest.importorskip("mlx.core" if backend == "mlx" else "spandrel")
+    monkeypatch.setenv("TDPLAY_UPSCALE_BACKEND", backend)
+
+
+@pytest.mark.parametrize("backend", ["mlx", "torch"])
+def test_real_upscale_of_a_tiny_clip(tmp_path, weights_home, backend, monkeypatch):
     from tdplay import upscale
+
+    use_backend(backend, monkeypatch)
 
     src = tmp_path / "in.mp4"
     tiny_clip(src)
@@ -73,6 +81,7 @@ def test_real_upscale_of_a_tiny_clip(tmp_path, weights_home):
 
 
 def test_mlx_network_matches_pytorch(weights_home):
+    pytest.importorskip("mlx.core")
     torch = pytest.importorskip("torch")
     spandrel = pytest.importorskip("spandrel")
     import mlx.core as mx
@@ -92,6 +101,7 @@ def test_mlx_network_matches_pytorch(weights_home):
 
 
 def test_mac_and_windows_upscalers_agree(weights_home):
+    pytest.importorskip("mlx.core")
     pytest.importorskip("spandrel")
     import mlx.core as mx
 
@@ -103,14 +113,19 @@ def test_mac_and_windows_upscalers_agree(weights_home):
     assert np.abs(on_mac - on_windows).max() <= 1
 
 
-def test_tiles_join_without_visible_seams(weights_home):
-    import mlx.core as mx
-
+@pytest.mark.parametrize("backend", ["mlx", "torch"])
+def test_tiles_join_without_visible_seams(weights_home, backend, monkeypatch):
     from tdplay import upscale
 
+    use_backend(backend, monkeypatch)
     yy, xx = np.mgrid[0:40, 0:56]
     rgb = np.stack([xx * 4, yy * 6, np.full_like(xx, 100)], -1).astype(np.uint8)
-    up = upscale.Upscaler("fast", dtype=mx.float32)
+    if backend == "mlx":
+        import mlx.core as mx
+
+        up = upscale.Upscaler("fast", dtype=mx.float32)
+    else:
+        up = upscale.TorchUpscaler("fast")
     up.tile = 0
     whole = up.frame(rgb).astype(int)
     up.tile = 24

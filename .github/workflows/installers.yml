@@ -1,6 +1,7 @@
 # Builds the Mac disk image and the Windows installer, installs each one the way a user would, checks
 # that the installed app works (a short render with a stand-in model; the runners have no usable GPU
-# for the real one), and publishes both on a GitHub release when a v* tag is pushed.
+# for the real one), and publishes both on a GitHub release when a v* tag is pushed. The installers go
+# straight onto a draft release (no workflow artifacts), which is published once both jobs passed.
 name: Installers
 
 on:
@@ -18,8 +19,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  draft:
+    name: Draft the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --draft --verify-tag \
+            --title "TDPlay AI Video Render ${GITHUB_REF_NAME#v}" --notes-file .github/release-notes.md
+
   macos:
     name: Mac disk image
+    needs: [draft]
+    if: ${{ !cancelled() && needs.draft.result != 'failure' }}
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -57,13 +72,16 @@ jobs:
         if: failure()
         run: python3 .github/annotate.py macOS "${HOME}/TDPlay/logs/setup.log" smoke.log pytest.log
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos
-          path: dist/*.dmg
+      - name: Add the disk image to the draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/*.dmg --clobber
 
   windows:
     name: Windows installer
+    needs: [draft]
+    if: ${{ !cancelled() && needs.draft.result != 'failure' }}
     runs-on: windows-2025
     timeout-minutes: 90
     defaults:
@@ -130,10 +148,11 @@ jobs:
         if: failure()
         run: python .github/annotate.py Windows installer-setup.log setup.log smoke.log pytest.log install.log
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows
-          path: dist/*.exe
+      - name: Add Setup.exe to the draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload $env:GITHUB_REF_NAME (Get-ChildItem dist\TDPlay-AI-Video-Render-Setup-*.exe).FullName --clobber
 
   release:
     name: Publish the release
@@ -141,14 +160,6 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Create the release with both installers
-        env:
+      - env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${GITHUB_REF_NAME}" dist/* --title "TDPlay AI Video Render ${GITHUB_REF_NAME#v}" \
-            --notes-file .github/release-notes.md
+        run: gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest
