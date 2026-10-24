@@ -255,6 +255,9 @@ go back to Balanced if the screen flickers or goes black. 704p (1280×704) is wo
 * **"ffmpeg was installed but Windows can't find it yet"** → sign out and back in, run `install.bat` again.
 * **The full log** is `log.txt` in each project folder. The app's own log is `%USERPROFILE%\TDPlay\logs\app.log`.
 * **Moved the folder?** Run `install.bat` again so the shortcuts point to it.
+* **Faint straight see-through lines** (a cross about 70% across and 70% down) came from decoding each frame in
+  overlapping tiles. Since 1.5.1 every frame is decoded whole, so new renders don't have them; videos made
+  before keep them.
 
 ## How it works
 

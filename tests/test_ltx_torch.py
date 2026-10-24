@@ -117,7 +117,8 @@ def test_prompts_are_encoded_once_and_the_first_reaches_prepare_run():
     def fake_prepare_run(**kwargs):  # what the real _prepare_run does with the encoder
         (first,) = pipe.prompt_encoder([kwargs["prompt"]], enhance_first_prompt=False, enhance_static_cache=False,
                                        enhance_prompt_image=None)
-        seen.update(first=first, num_frames=kwargs["num_frames"], chunk=kwargs["chunk_config"])
+        seen.update(first=first, num_frames=kwargs["num_frames"], chunk=kwargs["chunk_config"],
+                    tiling=kwargs["tiling_config"])
         raise StopIteration  # stop before any model work
 
     pipe._prepare_run = fake_prepare_run
@@ -128,6 +129,29 @@ def test_prompts_are_encoded_once_and_the_first_reaches_prepare_run():
     assert seen["first"].i == 0 and seen["num_frames"] == 97
     assert isinstance(seen["chunk"], D.ChunkConfig) and seen["chunk"].chunk_pixel_frames == 73
     assert pipe.prompt_encoder is encoder  # restored afterwards
+    assert seen["tiling"] == ltx_torch.decode_tiling()
+
+
+def test_frames_are_decoded_whole_so_no_tile_seams_show():
+    pytest.importorskip("ltx_pipelines")
+    import ltx_pipelines.utils.helpers as helpers
+    from ltx_core.tiling import TileSizeConfig
+    from ltx_core.types import VIDEO_SCALE_FACTORS, VideoPixelShape
+
+    for height, width in [(1024, 576), (576, 1024), (1280, 704), (704, 1280), (896, 512), (576, 576)]:
+        shape = VideoPixelShape(batch=1, frames=121, height=height, width=width, fps=24)
+        # LTX-2's own choice cuts a 576p frame or bigger into overlapping tiles, whose overlaps show as lines.
+        auto = TileSizeConfig.from_long_side(long_side=helpers._CONV_AUTO_LONG_SIDE, height=height, width=width,
+                                             scale_factors=VIDEO_SCALE_FACTORS, frames=helpers._CONV_AUTO_FRAMES)
+        whole = ltx_torch.decode_tiling()
+        whole.validate(VIDEO_SCALE_FACTORS, shape)
+        frames, rows, cols = whole.to_splitters(VIDEO_SCALE_FACTORS)
+        assert len(rows(height // 32).intervals) == 1 and len(cols(width // 32).intervals) == 1
+        assert whole.frames == auto.frames  # time is still decoded in overlapping pieces, as LTX-2 does
+        assert len(frames(16).intervals) == 2
+        if max(height, width) > 768:
+            _, auto_rows, auto_cols = auto.to_splitters(VIDEO_SCALE_FACTORS)
+            assert len(auto_rows(height // 32).intervals) * len(auto_cols(width // 32).intervals) > 1
 
 
 def test_weights_are_read_without_mapping_the_files(tmp_path, monkeypatch):

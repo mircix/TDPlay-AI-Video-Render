@@ -34,6 +34,21 @@ from pathlib import Path
 CARRY_FRAMES = 25
 
 
+#: How the VAE decodes a shot: in pieces of 80 frames that overlap by 24, as LTX-2 does, but whole frames.
+#: LTX-2's automatic choice also cuts a frame longer than 768 px into overlapping tiles, and the overlaps
+#: show as faint see-through lines (a cross about 70% across and 70% down a 576p shot). Its VAE decodes
+#: frame by frame anyway, so a whole frame needs only a few GB of the card's memory.
+DECODE_FRAMES = (80, 24)
+
+
+def decode_tiling():
+    from ltx_core.tiling import DimensionSizeConfig, TileSizeConfig
+
+    frames, overlap = DECODE_FRAMES
+    return TileSizeConfig(frames=DimensionSizeConfig(tile_size=frames, overlap=overlap),
+                          height=DimensionSizeConfig(), width=DimensionSizeConfig())
+
+
 def plan_frames(first_frames: int, new_frames: list[int], carry: int = CARRY_FRAMES) -> list[dict]:
     """Chunk windows for a shot: the first segment's frames, then ``carry + new`` per later segment.
 
@@ -157,7 +172,7 @@ def _pipeline_class():
             try:
                 ctx = self._prepare_run(
                     prompt=prompts[0], seed=seed, height=height, width=width, frame_rate=frame_rate, images=images,
-                    num_frames=total, vae_dtype=None, tiling_config=D.AUTO_TILING, enhance_prompt=False,
+                    num_frames=total, vae_dtype=None, tiling_config=decode_tiling(), enhance_prompt=False,
                     enhance_static_cache=False, generated_keyframes=0, decode_with_keyframes=False,
                     chunk_config=D.ChunkConfig(
                         chunk_pixel_frames=max(layout.pixel_frames for layout in layouts),
